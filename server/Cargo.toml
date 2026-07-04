@@ -1,0 +1,24 @@
+# Rust server-side workspace for h2ts.
+#
+#   ws-tcp      — library: make a WebSocket look like raw TCP (AsyncRead+AsyncWrite).
+#                 The framing backend is swappable; today it's fastwebsockets,
+#                 later a wslay-based backend for true sub-frame streaming.
+#   h2ts-proxy  — binary: terminate a WebSocket and forward raw bytes to an
+#                 upstream h2c server (a drop-in, in-Rust replacement for websockify).
+[workspace]
+resolver = "2"
+members = ["crates/ws-tcp", "crates/proxy"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+fastwebsockets = { version = "0.10", features = ["upgrade", "unstable-split"] }
+anyhow = "1"

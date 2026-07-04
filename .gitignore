@@ -1,0 +1,25 @@
+# Dependencies
+/node_modules/
+
+# Build output
+/dist/
+/server/target/
+*.tsbuildinfo
+
+# Test coverage
+/coverage/
+
+# Vendored HTTP/2 reference implementation — used only as a dev reference,
+# not part of this project and not shipped.
+/http2.js/
+
+# Local Claude Code / agent state (permissions, etc.)
+/.claude/
+
+# Editor & OS cruft
+.DS_Store
+Thumbs.db
+*.log
+*.swp
+.idea/
+.vscode/
