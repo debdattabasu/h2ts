@@ -16,12 +16,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::net::{TcpListener, TcpStream};
-use ws_tcp::{accept, is_upgrade_request};
-// Swappable framing backend, selected at compile time.
-#[cfg(feature = "wslay")]
-use ws_tcp::wslay_bridge as bridge;
-#[cfg(not(feature = "wslay"))]
-use ws_tcp::bridge;
+use ws_tcp::{accept, bridge, is_upgrade_request};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 

@@ -1,24 +1,23 @@
-//! wslay framing backend (feature `wslay`).
+//! wslay framing (the WebSocket ⇄ byte-stream pump).
 //!
-//! [`fastwebsockets`] buffers a whole frame before yielding it. wslay, driven
-//! through its event API with `no_buffering` enabled, delivers each frame's
-//! payload **incrementally** via `on_frame_recv_chunk_callback` — so we never
-//! hold a whole frame in memory, no matter how large. Control frames (ping /
-//! close) are still auto-handled by wslay.
+//! wslay, driven through its event API with `no_buffering` enabled, delivers
+//! each frame's payload **incrementally** via `on_frame_recv_chunk_callback` —
+//! so we never hold a whole frame in memory, no matter how large. Control frames
+//! (ping / close) are auto-handled by wslay.
 //!
 //! wslay is a synchronous, I/O-agnostic state machine: it never touches the
 //! socket itself, only in-memory buffers via callbacks. We drive it from async
 //! Rust — feeding it bytes we read from the WebSocket and flushing bytes it
-//! produces. The HTTP upgrade is still done by hyper/fastwebsockets in
-//! [`accept`](crate::accept); here we take the raw upgraded stream via
-//! [`WebSocket::into_inner`] (no frames have been read yet, so nothing is lost).
+//! produces. The HTTP upgrade is done separately in [`accept`](crate::accept),
+//! which hands us the raw upgraded byte stream (no frames have been read yet, so
+//! nothing is lost).
 //!
 //! The wslay context and the shared-state cell are reached from the two
 //! directions as `usize` addresses (which are `Send`), cast back to raw pointers
 //! only inside the synchronous `unsafe` sections. This keeps the future `Send`
-//! (so it composes like [`bridge`](crate::bridge)) while never letting a bare
-//! pointer live across an `.await`. It is sound because everything runs on one
-//! task: the two directions interleave at awaits but never execute concurrently.
+//! (so it composes like a normal async fn) while never letting a bare pointer
+//! live across an `.await`. It is sound because everything runs on one task: the
+//! two directions interleave at awaits but never execute concurrently.
 
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -28,7 +27,6 @@ use std::ptr;
 use std::slice;
 use std::sync::Arc;
 
-use fastwebsockets::WebSocket;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 use wslay_sys::*;
@@ -126,18 +124,20 @@ impl Drop for CtxGuard {
     }
 }
 
-/// Full-duplex byte pump between a WebSocket and a peer, using wslay for framing.
-/// The wslay analogue of [`bridge`](crate::bridge): WS payloads flow to `peer`;
+/// Pump bytes full-duplex between a WebSocket and a byte-stream peer until either
+/// side closes, using wslay for framing. WS message payloads flow to `peer`;
 /// `peer` bytes flow back as binary WS frames — all streamed incrementally,
 /// never buffering a whole frame.
-pub async fn wslay_bridge<S, P>(ws: WebSocket<S>, peer: P) -> io::Result<()>
+///
+/// `ws_io` is the raw upgraded WebSocket byte stream from [`accept`](crate::accept).
+/// This is item 3's core: `bridge(ws_io, TcpStream::connect(upstream))` is a
+/// websockify-equivalent WS→TCP proxy.
+pub async fn bridge<S, P>(ws_io: S, peer: P) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     P: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    // Take the raw upgraded stream; no frames have been read yet.
-    let raw = ws.into_inner();
-    let (mut ws_read, ws_write) = tokio::io::split(raw);
+    let (mut ws_read, ws_write) = tokio::io::split(ws_io);
     let (mut peer_read, mut peer_write) = tokio::io::split(peer);
     let ws_write = Arc::new(Mutex::new(ws_write));
 

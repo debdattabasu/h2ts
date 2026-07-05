@@ -3,17 +3,12 @@ name = "ws-tcp"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "Make a WebSocket look like raw TCP, and serve/proxy HTTP/2 over it. Includes the h2ts-proxy binary."
+description = "Make a WebSocket look like raw TCP, and serve/proxy HTTP/2 over it. Framed by wslay for true sub-frame streaming. Includes the h2ts-proxy binary."
 repository = "https://github.com/debdattabasu/h2ts"
 keywords = ["websocket", "http2", "tunnel", "proxy", "async"]
 categories = ["network-programming", "web-programming::websocket"]
 
 # The h2ts-proxy binary ships with the crate (src/bin/h2ts-proxy.rs).
-
-[features]
-# Frame the WebSocket with wslay (separate `wslay-sys` crate) instead of
-# fastwebsockets, gaining true sub-frame streaming (never buffers a whole frame).
-wslay = ["dep:wslay-sys"]
 
 [dependencies]
 tokio = { workspace = true }
@@ -22,10 +17,12 @@ hyper-util = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
-fastwebsockets = { workspace = true }
+sha1 = { workspace = true }
+base64 = { workspace = true }
 # `version` is required for publishing; `path` is used for local builds.
-wslay-sys = { path = "../wslay-sys", version = "0.1.0", optional = true }
+wslay-sys = { path = "../wslay-sys", version = "0.1.0" }
 
-# Used only by examples (examples may use both normal and dev dependencies).
 [dev-dependencies]
 anyhow = { workspace = true }
+# Used only by examples and the integration tests (a stand-in for the TS client).
+fastwebsockets = { workspace = true }
