@@ -257,3 +257,89 @@ async fn h2_over_ws_concurrent_streams() {
         assert_eq!(h.await.unwrap(), Bytes::from_static(b"hi"));
     }
 }
+
+// --- Same round trip, but framed by the wslay backend (feature `wslay`) -------
+
+#[cfg(feature = "wslay")]
+mod wslay_backend {
+    use super::*;
+    use ws_tcp::wslay_serve_h2;
+
+    async fn upgrade_handler(
+        mut req: Request<Incoming>,
+    ) -> Result<Response<Empty<Bytes>>, WebSocketError> {
+        let (response, ws_fut) = accept(&mut req)?;
+        tokio::spawn(async move {
+            if let Ok(ws) = ws_fut.await {
+                let _ = wslay_serve_h2(ws, service_fn(app)).await;
+            }
+        });
+        Ok(response)
+    }
+
+    async fn start_wslay_server() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(socket);
+                    let _ = http1::Builder::new()
+                        .serve_connection(io, service_fn(upgrade_handler))
+                        .with_upgrades()
+                        .await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn h2_over_ws_via_wslay_roundtrip() {
+        let addr = start_wslay_server().await;
+        let (mut sender, negotiated) = connect_h2(addr, true).await;
+        assert_eq!(negotiated.as_deref(), Some("binary"));
+
+        let res = sender.send_request(get(addr, "/hello")).await.unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(
+            res.into_body().collect().await.unwrap().to_bytes(),
+            Bytes::from_static(b"hi")
+        );
+
+        let echo = Request::builder()
+            .method("POST")
+            .uri(format!("http://{addr}/echo"))
+            .body(Full::new(Bytes::from_static(b"wslay-round-trips!")))
+            .unwrap();
+        let res = sender.send_request(echo).await.unwrap();
+        assert_eq!(
+            res.into_body().collect().await.unwrap().to_bytes(),
+            Bytes::from_static(b"wslay-round-trips!")
+        );
+
+        // 100 KiB — streamed incrementally across many frames through wslay.
+        let res = sender.send_request(get(addr, "/big")).await.unwrap();
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.len(), 100 * 1024);
+        assert!(body.iter().all(|&b| b == b'x'));
+    }
+
+    #[tokio::test]
+    async fn h2_over_ws_via_wslay_concurrent() {
+        let addr = start_wslay_server().await;
+        let (sender, _) = connect_h2(addr, false).await;
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let mut s = sender.clone();
+            handles.push(tokio::spawn(async move {
+                let res = s.send_request(get(addr, "/hello")).await.unwrap();
+                res.into_body().collect().await.unwrap().to_bytes()
+            }));
+        }
+        for h in handles {
+            assert_eq!(h.await.unwrap(), Bytes::from_static(b"hi"));
+        }
+    }
+}

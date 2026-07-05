@@ -1,5 +1,6 @@
 //! h2ts-proxy — terminate a WebSocket and forward raw bytes to an upstream h2c
-//! server. A drop-in, in-Rust replacement for websockify (item 3).
+//! server. A drop-in, in-Rust replacement for websockify (item 3), shipped as a
+//! binary of the `ws-tcp` crate.
 //!
 //!   browser (h2ts) --ws--> [h2ts-proxy] --tcp--> upstream h2c server
 //!
@@ -7,7 +8,6 @@
 //!        defaults:   127.0.0.1:8091   127.0.0.1:8000
 use std::net::SocketAddr;
 
-use anyhow::Result;
 use bytes::Bytes;
 use http_body_util::Empty;
 use hyper::body::Incoming;
@@ -16,10 +16,17 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::net::{TcpListener, TcpStream};
-use ws_tcp::{accept, bridge, is_upgrade_request};
+use ws_tcp::{accept, is_upgrade_request};
+// Swappable framing backend, selected at compile time.
+#[cfg(feature = "wslay")]
+use ws_tcp::wslay_bridge as bridge;
+#[cfg(not(feature = "wslay"))]
+use ws_tcp::bridge;
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), BoxError> {
     let mut args = std::env::args().skip(1);
     let listen: SocketAddr = args
         .next()
@@ -51,7 +58,7 @@ async fn handle(
     mut req: Request<Incoming>,
     upstream: String,
     peer: SocketAddr,
-) -> Result<Response<Empty<Bytes>>> {
+) -> Result<Response<Empty<Bytes>>, BoxError> {
     if !is_upgrade_request(&req) {
         // Not a WebSocket handshake — this endpoint only tunnels.
         return Ok(Response::builder()

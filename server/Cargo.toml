@@ -7,7 +7,7 @@
 #                 upstream h2c server (a drop-in, in-Rust replacement for websockify).
 [workspace]
 resolver = "2"
-members = ["crates/ws-tcp", "crates/proxy"]
+members = ["crates/ws-tcp", "crates/wslay-sys"]
 
 [workspace.package]
 edition = "2021"

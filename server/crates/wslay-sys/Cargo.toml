@@ -1,0 +1,16 @@
+[package]
+name = "wslay-sys"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT"
+description = "Low-level FFI bindings to the wslay WebSocket C library (vendored)."
+repository = "https://github.com/debdattabasu/h2ts"
+readme = "README.md"
+keywords = ["websocket", "wslay", "ffi", "sys", "bindings"]
+categories = ["external-ffi-bindings", "network-programming"]
+links = "wslay"
+build = "build.rs"
+
+[build-dependencies]
+cc = "1"
+bindgen = "0.71"

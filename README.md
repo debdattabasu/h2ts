@@ -58,7 +58,7 @@ The server side supports two deployment shapes:
 - **`accept(&mut req)`** — the server-side WebSocket handshake as a plain hyper handler — **pluggable into any hyper/axum route**.
 - **`h2ts-proxy`** — a ~90-line standalone WS→upstream-h2c proxy binary.
 
-> The framing backend is [`fastwebsockets`](https://github.com/denoland/fastwebsockets) today (pure Rust, no C dependency). A [`wslay`](https://github.com/tatsuhiro-t/wslay)-based backend for true sub-frame streaming is planned behind the same API — see [Roadmap](#roadmap).
+> **Two framing backends, same API.** The default is [`fastwebsockets`](https://github.com/denoland/fastwebsockets) (pure Rust, no C dependency). Building with `--features wslay` swaps in a [`wslay`](https://github.com/tatsuhiro-t/wslay)-based backend (vendored C via `wslay-sys`) that streams frame payloads **incrementally** — it never buffers a whole frame, no matter how large — exposed as `wslay_bridge` / `wslay_serve_h2`.
 
 ---
 
@@ -103,8 +103,9 @@ Use `connect(transport, options)` if you already have a byte-duplex `Transport` 
 
 ```bash
 cd server
-cargo run -p h2ts-proxy -- 127.0.0.1:8091 127.0.0.1:8000
-#                          └ listen (ws)   └ upstream h2c server
+cargo run -p ws-tcp --bin h2ts-proxy -- 127.0.0.1:8091 127.0.0.1:8000
+#                                        └ listen (ws)   └ upstream h2c server
+# add --features wslay for the sub-frame-streaming backend
 ```
 
 Now `connectWebSocket("ws://127.0.0.1:8091", …)` reaches the HTTP/2 server on `:8000`.
@@ -200,10 +201,11 @@ h2ts/
 ├── test/                       # vitest unit tests + Node↔Rust e2e (test/e2e)
 ├── server/                     # Rust workspace
 │   └── crates/
-│       ├── ws-tcp/             #   the library (accept · bridge · WsByteStream · serve_h2)
+│       ├── ws-tcp/             #   the library + h2ts-proxy binary
+│       │   ├── src/bin/        #     h2ts-proxy (standalone WS→h2c proxy)
 │       │   ├── examples/       #     h2-server (in-process demo)
 │       │   └── tests/          #     native integration tests
-│       └── proxy/              #   h2ts-proxy binary (standalone)
+│       └── wslay-sys/          #   optional wslay FFI backend (published separately)
 └── poc/                        # original websockify proof-of-concept
 ```
 
@@ -224,7 +226,7 @@ cd server && cargo test     # unit + integration: bridge, WsByteStream, full h2-
 # End-to-end: h2ts client ↔ Rust server (no mocks)
 npm run build
 node poc/server.cjs &                                        # h2c echo server on :8000
-cargo run -p h2ts-proxy -- 127.0.0.1:8091 127.0.0.1:8000 &   # WS gateway on :8091
+cargo run -p ws-tcp --bin h2ts-proxy -- 127.0.0.1:8091 127.0.0.1:8000 &   # WS gateway on :8091
 WS_URL=ws://127.0.0.1:8091 node test/e2e/run.mjs
 ```
 
@@ -238,7 +240,7 @@ The e2e suite exercises the real path: routing, JSON, byte-exact uploads/downloa
 - [x] WebSocket transport + `fetch`-like API
 - [x] Rust `ws-tcp`: `accept`, `bridge`, `WsByteStream`, `serve_h2`
 - [x] `h2ts-proxy` standalone proxy
-- [ ] **`wslay` framing backend** — true sub-frame streaming (never buffer a whole frame), behind the existing `bridge`/`WsByteStream` API. `fastwebsockets` buffers one frame at a time, which is bounded for h2ts traffic but not for arbitrary TCP.
+- [x] **`wslay` framing backend** (`--features wslay`) — vendored C via `wslay-sys`, true sub-frame streaming (never buffers a whole frame), behind the same `bridge` / `serve_h2` API. `fastwebsockets` buffers one frame at a time, which is bounded for h2ts traffic but not for arbitrary TCP.
 - [ ] Publish `h2ts` to npm; publish `ws-tcp` to crates.io
 
 ---

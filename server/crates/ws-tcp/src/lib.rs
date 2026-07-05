@@ -266,6 +266,35 @@ where
         .await
 }
 
+#[cfg(feature = "wslay")]
+mod wslay;
+#[cfg(feature = "wslay")]
+pub use wslay::wslay_bridge;
+
+/// Like [`serve_h2`], but frames the WebSocket with wslay (feature `wslay`),
+/// which streams frame payloads incrementally rather than buffering whole
+/// frames. The service side is served over an in-memory duplex; the WebSocket
+/// side is pumped by [`wslay_bridge`].
+#[cfg(feature = "wslay")]
+pub async fn wslay_serve_h2<Svc, B>(ws: UpgradedWebSocket, service: Svc) -> std::io::Result<()>
+where
+    Svc: Service<Request<Incoming>, Response = Response<B>> + Send + 'static,
+    Svc::Future: Send + 'static,
+    Svc::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    B: Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let (app_side, ws_side) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let io = TokioIo::new(app_side);
+        let _ = http2::Builder::new(TokioExecutor::new())
+            .serve_connection(io, service)
+            .await;
+    });
+    wslay_bridge(ws, ws_side).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::offers_protocol;
