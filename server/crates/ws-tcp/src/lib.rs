@@ -31,8 +31,14 @@ use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 mod handshake;
 mod wslay;
 
-pub use handshake::{accept, is_upgrade_request, UpgradedIo, WebSocketError};
-pub use wslay::bridge;
+pub use handshake::{
+    accept, accept_with, is_upgrade_request, offered_protocols, UpgradedIo, WebSocketError,
+    DEFAULT_SUBPROTOCOL,
+};
+pub use wslay::{
+    bridge, bridge_with, control_channel, BridgeConfig, CloseFrame, CloseHook, ControlHook,
+    ControlReceiver, KeepAlive, WsControl,
+};
 
 /// Size of the in-memory duplex between the WebSocket pump and the app side.
 const DUPLEX_BUF: usize = 64 * 1024;
@@ -56,9 +62,19 @@ impl WsByteStream {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        Self::with_config(ws_io, BridgeConfig::default())
+    }
+
+    /// Like [`WsByteStream::new`], but with control-frame configuration and hooks
+    /// ([`BridgeConfig`]) — e.g. a [`control_channel`] to send control frames, or
+    /// `on_close` to observe the peer's close reason.
+    pub fn with_config<S>(ws_io: S, config: BridgeConfig) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let (app_side, ws_side) = tokio::io::duplex(DUPLEX_BUF);
         tokio::spawn(async move {
-            let _ = bridge(ws_io, ws_side).await;
+            let _ = bridge_with(ws_io, ws_side, config).await;
         });
         Self { inner: app_side }
     }
@@ -122,7 +138,27 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    let io = TokioIo::new(WsByteStream::new(ws_io));
+    serve_h2_with(ws_io, service, BridgeConfig::default()).await
+}
+
+/// Like [`serve_h2`], but with control-frame configuration and hooks
+/// ([`BridgeConfig`]) applied to the underlying WebSocket bridge — send control
+/// frames via a [`control_channel`], observe the peer's close reason, etc.
+pub async fn serve_h2_with<S, Svc, B>(
+    ws_io: S,
+    service: Svc,
+    config: BridgeConfig,
+) -> hyper::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    Svc: Service<Request<Incoming>, Response = Response<B>> + Send + 'static,
+    Svc::Future: Send + 'static,
+    Svc::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    B: Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let io = TokioIo::new(WsByteStream::with_config(ws_io, config));
     http2::Builder::new(TokioExecutor::new())
         .serve_connection(io, service)
         .await

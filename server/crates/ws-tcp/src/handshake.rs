@@ -23,6 +23,10 @@ use sha1::{Digest, Sha1};
 /// RFC 6455 §4.2.2: the magic GUID appended to the client key before hashing.
 const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
+/// The subprotocol h2ts clients offer by default. [`accept`] echoes it when the
+/// client offered it and the handler didn't choose another (see [`accept_with`]).
+pub const DEFAULT_SUBPROTOCOL: &str = "h2ts";
+
 /// The upgraded WebSocket connection, presented as a raw tokio byte stream
 /// (`AsyncRead + AsyncWrite`). Hand it to [`bridge`](crate::bridge),
 /// [`serve_h2`](crate::serve_h2), or [`WsByteStream`](crate::WsByteStream).
@@ -75,14 +79,21 @@ pub fn is_upgrade_request<B>(request: &Request<B>) -> bool {
         && request.headers().contains_key(SEC_WEBSOCKET_KEY)
 }
 
-/// Whether the request offers the given WebSocket subprotocol.
-pub(crate) fn offers_protocol<B>(request: &Request<B>, name: &str) -> bool {
+/// The WebSocket subprotocols the client offered, in order, whitespace-trimmed;
+/// empty if it offered none. Gives a handler full visibility into the offer so
+/// it can pass one to [`accept_with`].
+pub fn offered_protocols<B>(request: &Request<B>) -> Vec<&str> {
     request
         .headers()
         .get(SEC_WEBSOCKET_PROTOCOL)
         .and_then(|v| v.to_str().ok())
-        .map(|list| list.split(',').any(|p| p.trim().eq_ignore_ascii_case(name)))
-        .unwrap_or(false)
+        .map(|list| {
+            list.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Compute the `Sec-WebSocket-Accept` value for a client `Sec-WebSocket-Key`.
@@ -93,31 +104,41 @@ fn accept_key(key: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
 }
 
-/// Accept a WebSocket upgrade on a hyper request.
+/// Accept a WebSocket upgrade, choosing which offered subprotocol to echo.
 ///
-/// Returns the `101 Switching Protocols` response to send back immediately, plus
-/// a future that resolves to the upgraded connection as a byte stream
-/// ([`UpgradedIo`]). Drive the response through your framework; spawn the future
-/// and hand the stream to [`bridge`](crate::bridge) or
-/// [`serve_h2`](crate::serve_h2).
+/// `select` is handed the full list of subprotocols the client offered (the same
+/// thing [`offered_protocols`] returns) and returns the one to echo in the `101`,
+/// or `None` to decline. When it declines, [`DEFAULT_SUBPROTOCOL`] (`h2ts`) is
+/// echoed if the client offered it; otherwise nothing is echoed.
 ///
-/// If the client offered the `binary` subprotocol (h2ts / websockify clients do)
-/// it is echoed. Control frames (ping/close) are handled downstream by wslay.
+/// Per RFC 6455 a client that offered subprotocols will *fail* the connection if
+/// the server echoes one it did not offer, so `select` should return a member of
+/// the offered list (or `None`).
 ///
-/// The outer HTTP/1 connection must be served with upgrades enabled
-/// (`http1::Builder::serve_connection(..).with_upgrades()`).
+/// See [`accept`] for the common case.
+///
+/// ```ignore
+/// // Prefer "chat" if the client offered it, otherwise fall back to h2ts.
+/// let (response, ws_fut) = ws_tcp::accept_with(&mut req, |offered| {
+///     offered.iter().find(|p| p.eq_ignore_ascii_case("chat")).map(|p| p.to_string())
+/// })?;
+/// ```
 // The returned `impl Future` can't be aliased away, so the tuple reads as
 // "complex"; it's just (response, upgrade-future).
 #[allow(clippy::type_complexity)]
-pub fn accept<B>(
+pub fn accept_with<B, F>(
     request: &mut Request<B>,
+    select: F,
 ) -> Result<
     (
         Response<Empty<Bytes>>,
         impl Future<Output = Result<UpgradedIo, WebSocketError>>,
     ),
     WebSocketError,
-> {
+>
+where
+    F: FnOnce(&[&str]) -> Option<String>,
+{
     if !is_upgrade_request(request) {
         return Err(WebSocketError::NotUpgradeRequest);
     }
@@ -128,7 +149,16 @@ pub fn accept<B>(
         .ok_or(WebSocketError::NotUpgradeRequest)?;
     let accept_value = accept_key(key.as_bytes());
 
-    let echo_binary = offers_protocol(request, "binary");
+    // Let the handler pick from the offered list; otherwise echo the default
+    // subprotocol when the client offered it.
+    let offered = offered_protocols(request);
+    let chosen = select(&offered).or_else(|| {
+        offered
+            .iter()
+            .find(|p| p.eq_ignore_ascii_case(DEFAULT_SUBPROTOCOL))
+            .map(|p| p.to_string())
+    });
+    drop(offered); // release the immutable borrow before upgrading below
 
     // base64 output is always valid header-value ASCII, so this never fails.
     let accept_header =
@@ -140,10 +170,13 @@ pub fn accept<B>(
         .header(SEC_WEBSOCKET_ACCEPT, accept_header)
         .body(Empty::<Bytes>::new())
         .expect("static 101 response is well-formed");
-    if echo_binary {
-        response
-            .headers_mut()
-            .insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static("binary"));
+    if let Some(proto) = chosen {
+        // Skip a subprotocol that isn't a valid header value rather than fail.
+        if let Ok(value) = HeaderValue::from_str(&proto) {
+            response
+                .headers_mut()
+                .insert(SEC_WEBSOCKET_PROTOCOL, value);
+        }
     }
 
     // Capture the upgrade future now; it resolves once the 101 is flushed and
@@ -156,9 +189,37 @@ pub fn accept<B>(
     Ok((response, fut))
 }
 
+/// Accept a WebSocket upgrade, echoing [`DEFAULT_SUBPROTOCOL`] (`h2ts`) when the
+/// client offered it.
+///
+/// Returns the `101 Switching Protocols` response to send back immediately, plus
+/// a future that resolves to the upgraded connection as a byte stream
+/// ([`UpgradedIo`]). Drive the response through your framework; spawn the future
+/// and hand the stream to [`bridge`](crate::bridge) or
+/// [`serve_h2`](crate::serve_h2).
+///
+/// Use [`accept_with`] to inspect the offered subprotocols (see
+/// [`offered_protocols`]) and choose which to echo. Control frames (ping/close)
+/// are handled downstream by wslay.
+///
+/// The outer HTTP/1 connection must be served with upgrades enabled
+/// (`http1::Builder::serve_connection(..).with_upgrades()`).
+#[allow(clippy::type_complexity)]
+pub fn accept<B>(
+    request: &mut Request<B>,
+) -> Result<
+    (
+        Response<Empty<Bytes>>,
+        impl Future<Output = Result<UpgradedIo, WebSocketError>>,
+    ),
+    WebSocketError,
+> {
+    accept_with(request, |_offered| None)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_upgrade_request, offers_protocol};
+    use super::{is_upgrade_request, offered_protocols};
     use http::header::{
         CONNECTION, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_PROTOCOL, UPGRADE,
     };
@@ -173,12 +234,15 @@ mod tests {
     }
 
     #[test]
-    fn offers_protocol_is_case_insensitive_and_list_aware() {
-        assert!(offers_protocol(&with_protocol(Some("binary")), "binary"));
-        assert!(offers_protocol(&with_protocol(Some("chat, binary")), "binary"));
-        assert!(offers_protocol(&with_protocol(Some(" BINARY ")), "binary"));
-        assert!(!offers_protocol(&with_protocol(Some("chat")), "binary"));
-        assert!(!offers_protocol(&with_protocol(None), "binary"));
+    fn offered_protocols_parses_the_list_in_order() {
+        assert_eq!(offered_protocols(&with_protocol(Some("h2ts"))), ["h2ts"]);
+        assert_eq!(
+            offered_protocols(&with_protocol(Some("chat, h2ts, binary"))),
+            ["chat", "h2ts", "binary"]
+        );
+        assert_eq!(offered_protocols(&with_protocol(Some("  h2ts  "))), ["h2ts"]);
+        assert!(offered_protocols(&with_protocol(Some(""))).is_empty());
+        assert!(offered_protocols(&with_protocol(None)).is_empty());
     }
 
     #[test]

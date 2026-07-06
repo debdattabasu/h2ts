@@ -32,6 +32,8 @@ It comes in two halves that are useful independently:
 
 HTTP/2 frames are carried **inside** the WebSocket as binary messages. TLS is provided by `wss://` on the outside; the tunnelled HTTP/2 is cleartext (**h2c**, prior-knowledge). No TLS, ALPN, or `Upgrade` dance on the inside.
 
+The client offers the **`h2ts`** WebSocket subprotocol (append your own alongside it); the server sees the full offered list and chooses which to echo — defaulting to `h2ts`. Append `binary` to interoperate with `websockify`.
+
 The server side supports two deployment shapes:
 
 - **Standalone proxy** (`h2ts-proxy`) — terminates the WebSocket and forwards raw bytes to an upstream h2c server. A drop-in, in-Rust replacement for [`websockify`](https://github.com/novnc/websockify).
@@ -69,8 +71,10 @@ The server side supports two deployment shapes:
 ```ts
 import { connectWebSocket } from "h2ts";
 
-// Open the WebSocket and start an HTTP/2 client over it.
-const client = await connectWebSocket("ws://localhost:8091", { protocols: "binary" });
+// Open the WebSocket and start an HTTP/2 client over it. The `h2ts` subprotocol
+// is offered by default; append your own via `{ protocols: [...] }`.
+const client = await connectWebSocket("ws://localhost:8091");
+console.log(client.protocol); // negotiated subprotocol, e.g. "h2ts"
 
 // fetch-like requests, multiplexed over one connection.
 const res = await client.request({
@@ -103,8 +107,8 @@ Use `connect(transport, options)` if you already have a byte-duplex `Transport` 
 
 ```bash
 cd server
-cargo run -p ws-tcp --bin h2ts-proxy -- 127.0.0.1:8091 127.0.0.1:8000
-#                                        └ listen (ws)   └ upstream h2c server
+cargo run -p ws-tcp --bin h2ts-proxy -- 127.0.0.1:8091 127.0.0.1:8000 30
+#                                        └ listen (ws)   └ upstream h2c   └ keepalive secs (0/omit = off)
 ```
 
 Now `connectWebSocket("ws://127.0.0.1:8091", …)` reaches the HTTP/2 server on `:8000`.
@@ -180,10 +184,34 @@ Server push: pass `onPush` in `ConnectOptions`.
 
 | Function | Purpose |
 |---|---|
-| `accept(&mut req) -> (Response, impl Future<UpgradedIo>)` | WebSocket handshake for any hyper route (item 4). |
+| `accept(&mut req) -> (Response, impl Future<UpgradedIo>)` | WebSocket handshake for any hyper route (item 4); echoes the `h2ts` subprotocol when offered. |
+| `accept_with(&mut req, select)` | Same, but `select(&[offered]) -> Option<String>` picks which offered subprotocol to echo. |
+| `offered_protocols(&req) -> Vec<&str>` | The subprotocols the client offered, in order. |
 | `serve_h2(ws_io, service)` | Serve any hyper `Service` as HTTP/2 over the tunnel (item 2). |
 | `bridge(ws_io, peer)` | Full-duplex byte pump WS ⇄ peer (item 3 core). |
 | `WsByteStream::new(ws_io)` | A WebSocket as `AsyncRead + AsyncWrite` (item 1). |
+| `bridge_with` / `serve_h2_with` / `WsByteStream::with_config` | Same, plus a `BridgeConfig` for control frames. |
+| `control_channel() -> (WsControl, ControlReceiver)` | `WsControl` sends `ping`/`pong`/`close` into a running bridge from any task. |
+
+**Control frames & keepalive.** wslay auto-answers incoming pings with pongs and echoes closes. A `BridgeConfig` lets you go further: **observe** every received frame (`on_ping`, `on_pong`, and `on_close` — which fires once with *why* the tunnel ended: the peer's close, a keepalive timeout, or `1006` abnormal), **send** your own control frames (`WsControl::ping`/`pong`/`close`), set the **close code+reason** sent on teardown, and turn on **server-initiated keepalive**.
+
+Keepalive matters because a browser's JavaScript `WebSocket` **cannot send pings** — the platform only auto-answers server pings — so liveness has to be driven from the server:
+
+```rust
+use std::time::Duration;
+
+let (control, control_rx) = ws_tcp::control_channel();
+let config = ws_tcp::BridgeConfig {
+    // Ping an idle client every 30s; close it if no response in 10s.
+    keepalive: Some(ws_tcp::KeepAlive::new(Duration::from_secs(30), Duration::from_secs(10))),
+    on_close: Some(Box::new(|cf| eprintln!("tunnel closed: {} {:?}", cf.code, cf.reason))),
+    on_pong:  Some(Box::new(|p| { /* measure RTT */ })),
+    control:  Some(control_rx),           // or drive pings yourself, keepalive: None
+    ..Default::default()
+};
+tokio::spawn(ws_tcp::serve_h2_with(ws, service, config));
+control.ping(b"are you there?".to_vec())?;   // send a control frame any time
+```
 
 ---
 

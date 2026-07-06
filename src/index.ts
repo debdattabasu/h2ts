@@ -1,7 +1,12 @@
 // h2ts — a tiny HTTP/2 client for the browser, tunneled over a WebSocket (or any
 // byte duplex). No Node core dependencies.
 
-export { connect, connectWebSocket, type WebSocketConnectOptions } from "./client.js";
+export {
+  connect,
+  connectWebSocket,
+  DEFAULT_SUBPROTOCOL,
+  type WebSocketConnectOptions,
+} from "./client.js";
 export { webSocketTransport, openWebSocket, type WebSocketLike } from "./transport/websocket.js";
 export type { Transport } from "./transport/transport.js";
 export { H2Connection } from "./connection.js";

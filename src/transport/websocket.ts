@@ -6,6 +6,8 @@ import type { Transport } from "./transport.js";
 export interface WebSocketLike {
   binaryType: string;
   readyState: number;
+  /** The subprotocol the server selected (empty string if none). */
+  readonly protocol?: string;
   send(data: ArrayBufferView | ArrayBuffer): void;
   close(code?: number, reason?: string): void;
   onopen: ((ev: unknown) => void) | null;

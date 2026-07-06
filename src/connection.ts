@@ -83,6 +83,12 @@ export class H2Connection {
   readonly closed: Promise<void>;
   private resolveClosed!: () => void;
 
+  /**
+   * The negotiated WebSocket subprotocol when opened via `connectWebSocket`
+   * (empty string if none was negotiated, or for non-WebSocket transports).
+   */
+  protocol = "";
+
   constructor(transport: Transport, options: ConnectOptions = {}) {
     this.transport = transport;
     this.writer = transport.writable.getWriter();
