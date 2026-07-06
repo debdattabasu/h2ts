@@ -259,14 +259,13 @@ h2ts/
 │   ├── stream.ts · flow.ts     #   per-stream state, flow control
 │   └── transport/              #   Transport interface + WebSocket adapter
 ├── test/                       # vitest unit tests + Node↔Rust e2e (test/e2e)
-├── server/                     # Rust workspace
-│   └── crates/
-│       ├── h2ts-server/             #   the library + h2ts-proxy binary
-│       │   ├── src/bin/        #     h2ts-proxy (standalone WS→h2c proxy)
-│       │   ├── examples/       #     h2-server (in-process demo)
-│       │   └── tests/          #     native integration tests
-│       └── wslay-sys/          #   wslay FFI framing backend (published separately)
-└── poc/                        # original websockify proof-of-concept
+└── server/                     # Rust workspace
+    └── crates/
+        ├── h2ts-server/        #   the library + h2ts-proxy binary
+        │   ├── src/bin/        #     h2ts-proxy (standalone WS→h2c proxy)
+        │   ├── examples/       #     h2-server (in-process demo)
+        │   └── tests/          #     native integration tests
+        └── wslay-sys/          #   wslay FFI framing backend (published separately)
 ```
 
 ---
@@ -285,12 +284,12 @@ cd server && cargo test     # unit + integration: bridge, WsByteStream, full h2-
 
 # End-to-end: h2ts client ↔ Rust server (no mocks)
 npm run build
-node poc/server.cjs &                                        # h2c echo server on :8000
+node test/e2e/origin.mjs &                                   # h2c echo origin on :8000
 cargo run -p h2ts-server --bin h2ts-proxy -- 127.0.0.1:8091 127.0.0.1:8000 &   # WS gateway on :8091
 WS_URL=ws://127.0.0.1:8091 node test/e2e/run.mjs
 ```
 
-The e2e suite exercises the real path: routing, JSON, byte-exact uploads/downloads, concurrent multiplexed streams, ping, and streaming reads — and passes identically against `websockify`, the Rust proxy, and the in-process `serve_h2`.
+The e2e suite exercises the real path: routing, JSON, byte-exact uploads/downloads, concurrent multiplexed streams, ping, and streaming reads — and passes identically against the Rust proxy (`h2ts-proxy`) and the in-process `serve_h2` (`h2-server` example).
 
 ---
 
@@ -301,7 +300,11 @@ The e2e suite exercises the real path: routing, JSON, byte-exact uploads/downloa
 - [x] Rust `h2ts-server`: `accept`, `bridge`, `WsByteStream`, `serve_h2`
 - [x] `h2ts-proxy` standalone proxy
 - [x] **`wslay` framing** (vendored C via `wslay-sys`) — the sole, default backend: true sub-frame streaming (never buffers a whole frame), with an in-crate RFC 6455 handshake (`sha1` + `base64`) and no pure-Rust WebSocket framing dependency.
-- [ ] Publish `h2ts` to npm; publish `h2ts-server` to crates.io
+- [x] Publish [`h2ts-server`](https://crates.io/crates/h2ts-server) to crates.io
+- [ ] Publish `h2ts` client to npm
+- [ ] **Envoy filter** — terminate the WebSocket tunnel as an Envoy HTTP filter, to run the gateway inside an existing Envoy/proxy mesh
+- [ ] **Go in-process server** — serve a Go `http.Handler` over the tunnel (a `serve_h2` equivalent)
+- [ ] **Node.js in-process server** — serve a Node `http2` service over the tunnel
 
 ---
 

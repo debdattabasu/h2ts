@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Make a WebSocket look like raw TCP, and serve/proxy HTTP/2 over it. Framed by wslay for true sub-frame streaming. Includes the h2ts-proxy binary."
 repository = "https://github.com/debdattabasu/h2ts"
+documentation = "https://docs.rs/h2ts-server"
+readme = "README.md"
 keywords = ["websocket", "http2", "tunnel", "proxy", "async"]
-categories = ["network-programming", "web-programming::websocket"]
+categories = ["network-programming", "web-programming::websocket", "asynchronous"]
 
 # The h2ts-proxy binary ships with the crate (src/bin/h2ts-proxy.rs).
 

@@ -1,8 +1,10 @@
-// End-to-end: h2ts client (built dist) --ws--> websockify --tcp--> Node h2c server.
-// Run the POC stack first (poc/server.js on :8000, websockify on :8090).
+// End-to-end: h2ts client (built dist) --ws--> h2ts-proxy --tcp--> Node h2c origin.
+// Start the stack first (see README): the h2c origin (test/e2e/origin.mjs on
+// :8000) and h2ts-proxy (WS gateway on :8091). Point WS_URL at another gateway to
+// test it instead — e.g. the in-process `h2-server` serve_h2 example.
 import { connectWebSocket } from "../../dist/index.js";
 
-const WS_URL = process.env.WS_URL || "ws://127.0.0.1:8090";
+const WS_URL = process.env.WS_URL || "ws://127.0.0.1:8091";
 const AUTH = "127.0.0.1:8000";
 
 let failures = 0;
@@ -12,7 +14,8 @@ function check(name, cond, extra = "") {
   console.log(`[${status}] ${name}${extra ? "  (" + extra + ")" : ""}`);
 }
 
-const client = await connectWebSocket(WS_URL, { protocols: "binary" });
+// Offers the `h2ts` subprotocol by default; h2ts-proxy accepts and echoes it.
+const client = await connectWebSocket(WS_URL);
 console.log("connected\n");
 
 // 1. Basic GET
