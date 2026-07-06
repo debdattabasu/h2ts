@@ -4,12 +4,17 @@
 //!
 //!   browser (h2ts) --ws--> [h2ts-proxy] --tcp--> upstream h2c server
 //!
-//! Usage: h2ts-proxy [listen_addr] [upstream_addr] [keepalive_secs]
-//!        defaults:   127.0.0.1:8091   127.0.0.1:8000   0 (off)
+//! Usage: h2ts-proxy [listen_addr] [upstream_addr] [keepalive_secs] [--allow-implicit-codec]
+//!        defaults:   127.0.0.1:8091   127.0.0.1:8000   0 (off)      (off; require h2ts)
 //!
 //! `keepalive_secs > 0` turns on server-initiated keepalive: the proxy pings an
 //! idle client every N seconds and closes it (1001 Going Away) if no response
 //! arrives within N more seconds.
+//!
+//! By default the proxy requires the `h2ts` subprotocol (rejecting others with a
+//! `400`). `--allow-implicit-codec` makes it a codec-agnostic byte tunnel that
+//! accepts whatever subprotocol the client offers (websockify-style `binary`,
+//! none, …) — the flag may appear anywhere on the command line.
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -21,19 +26,24 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::net::{TcpListener, TcpStream};
-use ws_tcp::{accept, bridge_with, is_upgrade_request, BridgeConfig, KeepAlive};
+use ws_tcp::{accept_with_options, bridge_with, AcceptOptions, BridgeConfig, KeepAlive};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
-    let mut args = std::env::args().skip(1);
+    // `--allow-implicit-codec` may appear anywhere; the rest are positional.
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let allow_implicit_codec = args.iter().any(|a| a == "--allow-implicit-codec");
+    args.retain(|a| a != "--allow-implicit-codec");
+    let mut args = args.into_iter();
+
     let listen: SocketAddr = args
         .next()
         .unwrap_or_else(|| "127.0.0.1:8091".to_string())
         .parse()?;
     let upstream: String = args.next().unwrap_or_else(|| "127.0.0.1:8000".to_string());
-    // Optional 3rd arg: keepalive interval (and pong timeout) in seconds.
+    // Optional 3rd positional: keepalive interval (and pong timeout) in seconds.
     let keepalive: Option<KeepAlive> = args
         .next()
         .and_then(|s| s.parse::<u64>().ok())
@@ -45,7 +55,8 @@ async fn main() -> Result<(), BoxError> {
         Some(k) => format!("keepalive {}s", k.interval.as_secs()),
         None => "keepalive off".to_string(),
     };
-    eprintln!("[h2ts-proxy] listening ws://{listen}  ->  tcp://{upstream} (h2c, {ka})");
+    let codec = if allow_implicit_codec { "any subprotocol" } else { "h2ts only" };
+    eprintln!("[h2ts-proxy] listening ws://{listen}  ->  tcp://{upstream} (h2c, {ka}, {codec})");
 
     loop {
         let (socket, peer) = listener.accept().await?;
@@ -53,8 +64,9 @@ async fn main() -> Result<(), BoxError> {
         let keepalive = keepalive.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(socket);
-            let service =
-                service_fn(move |req| handle(req, upstream.clone(), peer, keepalive.clone()));
+            let service = service_fn(move |req| {
+                handle(req, upstream.clone(), peer, keepalive.clone(), allow_implicit_codec)
+            });
             if let Err(err) = http1::Builder::new()
                 .serve_connection(io, service)
                 .with_upgrades()
@@ -71,15 +83,25 @@ async fn handle(
     upstream: String,
     peer: SocketAddr,
     keepalive: Option<KeepAlive>,
+    allow_implicit_codec: bool,
 ) -> Result<Response<Empty<Bytes>>, BoxError> {
-    if !is_upgrade_request(&req) {
-        // Not a WebSocket handshake — this endpoint only tunnels.
-        return Ok(Response::builder()
-            .status(426) // Upgrade Required
-            .body(Empty::new())?);
-    }
-
-    let (response, ws_fut) = accept(&mut req)?;
+    // Require h2ts by default; `--allow-implicit-codec` makes this a codec-agnostic
+    // tunnel that accepts whatever subprotocol the client offers (websockify-style
+    // `binary`, none, …). Either way a non-WebSocket request rejects (426), and a
+    // non-h2ts client rejects (400) when the flag is off.
+    let (response, ws_fut) = match accept_with_options(
+        &mut req,
+        |_offered| None,
+        AcceptOptions {
+            allow_implicit_codec,
+        },
+    ) {
+        Ok(pair) => pair,
+        Err(err) => {
+            eprintln!("[h2ts-proxy] rejected ({peer}): {err}");
+            return Ok(err.rejection_response());
+        }
+    };
 
     // Once the 101 is sent and the connection upgrades, bridge WS <-> upstream TCP.
     tokio::spawn(async move {

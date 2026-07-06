@@ -32,8 +32,8 @@ mod handshake;
 mod wslay;
 
 pub use handshake::{
-    accept, accept_with, is_upgrade_request, offered_protocols, UpgradedIo, WebSocketError,
-    DEFAULT_SUBPROTOCOL,
+    accept, accept_with, accept_with_options, is_upgrade_request, offered_protocols, AcceptOptions,
+    UpgradedIo, WebSocketError, DEFAULT_SUBPROTOCOL,
 };
 pub use wslay::{
     bridge, bridge_with, control_channel, BridgeConfig, CloseFrame, CloseHook, ControlHook,

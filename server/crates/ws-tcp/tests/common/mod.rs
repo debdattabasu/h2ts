@@ -137,7 +137,12 @@ pub async fn app(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infall
 async fn upgrade_handler(
     mut req: Request<Incoming>,
 ) -> Result<Response<Empty<Bytes>>, WebSocketError> {
-    let (response, ws_fut) = accept(&mut req)?;
+    // `accept` requires the h2ts subprotocol; a client without it is rejected
+    // with a clean 4xx rather than a dropped connection.
+    let (response, ws_fut) = match accept(&mut req) {
+        Ok(pair) => pair,
+        Err(err) => return Ok(err.rejection_response()),
+    };
     tokio::spawn(async move {
         if let Ok(ws) = ws_fut.await {
             let _ = serve_h2(ws, service_fn(app)).await;
@@ -205,6 +210,33 @@ pub async fn connect_h2(
         let _ = conn.await;
     });
     (sender, negotiated)
+}
+
+/// Perform *only* the WebSocket handshake over HTTP/1 and return the response
+/// status — `101` on accept, a `4xx` on reject. Does not upgrade or run h2, so it
+/// can observe a rejected handshake (which `connect_h2` would panic on).
+pub async fn handshake_status(addr: SocketAddr, offer: &[&str]) -> hyper::StatusCode {
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri(format!("http://{addr}/"))
+        .header("Host", addr.to_string())
+        .header(UPGRADE, "websocket")
+        .header(CONNECTION, "upgrade")
+        .header(SEC_WEBSOCKET_KEY, fastwebsockets::handshake::generate_key())
+        .header(SEC_WEBSOCKET_VERSION, "13");
+    if !offer.is_empty() {
+        builder = builder.header(SEC_WEBSOCKET_PROTOCOL, offer.join(", "));
+    }
+    let req = builder.body(Empty::<Bytes>::new()).unwrap();
+    sender.send_request(req).await.unwrap().status()
 }
 
 /// A simple GET request over the tunnel.

@@ -17,10 +17,10 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode};
+use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
-use ws_tcp::{accept, is_upgrade_request, serve_h2};
+use ws_tcp::{accept, serve_h2};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -49,13 +49,12 @@ async fn main() -> Result<()> {
 
 /// Accept the WebSocket upgrade, then serve HTTP/2 over the tunnel.
 async fn on_request(mut req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
-    if !is_upgrade_request(&req) {
-        return Ok(Response::builder()
-            .status(StatusCode::UPGRADE_REQUIRED)
-            .body(Full::new(Bytes::from("this endpoint speaks WebSocket-tunneled HTTP/2\n")))?);
-    }
-
-    let (response, ws_fut) = accept(&mut req)?;
+    // `accept` requires the h2ts subprotocol; a non-upgrade request (426) or a
+    // client without h2ts (400) is rejected with a clean response.
+    let (response, ws_fut) = match accept(&mut req) {
+        Ok(pair) => pair,
+        Err(err) => return Ok(err.rejection_response().map(|_| Full::new(Bytes::new()))),
+    };
     tokio::spawn(async move {
         let ws = match ws_fut.await {
             Ok(ws) => ws,

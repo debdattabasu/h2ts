@@ -32,7 +32,7 @@ It comes in two halves that are useful independently:
 
 HTTP/2 frames are carried **inside** the WebSocket as binary messages. TLS is provided by `wss://` on the outside; the tunnelled HTTP/2 is cleartext (**h2c**, prior-knowledge). No TLS, ALPN, or `Upgrade` dance on the inside.
 
-The client offers the **`h2ts`** WebSocket subprotocol (append your own alongside it); the server sees the full offered list and chooses which to echo — defaulting to `h2ts`. Append `binary` to interoperate with `websockify`.
+The client offers the **`h2ts`** WebSocket subprotocol (append your own alongside it). The server sees the full offered list and echoes one — a handler-selected protocol, or `h2ts` by default — and **rejects** (`400`) a client that offers no `h2ts` unless the handler selects one of its protocols or opts into `allow_implicit_codec` (a codec-agnostic tunnel that accepts whatever the client offered first — e.g. `h2ts-proxy --allow-implicit-codec`). Append `binary` to interoperate with `websockify`.
 
 The server side supports two deployment shapes:
 
@@ -111,7 +111,7 @@ cargo run -p ws-tcp --bin h2ts-proxy -- 127.0.0.1:8091 127.0.0.1:8000 30
 #                                        └ listen (ws)   └ upstream h2c   └ keepalive secs (0/omit = off)
 ```
 
-Now `connectWebSocket("ws://127.0.0.1:8091", …)` reaches the HTTP/2 server on `:8000`.
+Now `connectWebSocket("ws://127.0.0.1:8091", …)` reaches the HTTP/2 server on `:8000`. The proxy requires the `h2ts` subprotocol by default; add `--allow-implicit-codec` to accept any offered subprotocol (a generic byte tunnel / `websockify` replacement).
 
 ### Server — in-process, wrap any hyper service
 
@@ -130,6 +130,38 @@ async fn on_ws(mut req: Request<Incoming>) -> Result<Response<Empty<Bytes>>, ws_
     Ok(response)
 }
 ```
+
+You don't have to run HTTP/2 over it. The same upgraded `ws` is also available as a
+**naked byte stream** — [`WsByteStream::new(ws)`](server/crates/ws-tcp/src/lib.rs) is
+`AsyncRead + AsyncWrite`, so pipe it into anything that speaks TCP (or use
+[`bridge(ws, peer)`](server/crates/ws-tcp/src/wslay.rs) to pump it straight to a
+peer socket).
+
+For control over the WebSocket itself, swap in the `_with_config` variants
+(`serve_h2_with` / `WsByteStream::with_config` / `bridge_with`) and pass a `BridgeConfig`:
+
+```rust
+use ws_tcp::{serve_h2_with, control_channel, BridgeConfig, CloseFrame, KeepAlive};
+use std::time::Duration;
+
+let (control, control_rx) = control_channel(); // send ping/pong/close from any task
+let config = BridgeConfig {
+    // Intercept every control frame the client sends:
+    on_ping: Some(Box::new(|p| println!("ping {} bytes", p.len()))),
+    on_pong: Some(Box::new(|_p| { /* RTT sample, etc. */ })),
+    on_close: Some(Box::new(|cf: &CloseFrame| println!("closed: {} {:?}", cf.code, cf.reason))),
+    // Server-initiated keepalive: ping when idle, close if no pong in `timeout`.
+    keepalive: Some(KeepAlive::new(Duration::from_secs(15), Duration::from_secs(10))),
+    control: Some(control_rx),
+    ..Default::default()
+};
+let _ = serve_h2_with(ws, my_service, config).await;
+```
+
+`on_close` fires exactly once with *why* the tunnel ended — the peer's close, a keepalive
+timeout, or `1006` abnormal. Keepalive is opt-in; omit it (or set `keepalive: None`) to
+disable and drive ping/pong yourself via `control`. See the [API table](#server-ws-tcp)
+and the control-frame notes below it.
 
 A runnable version lives in [`server/crates/ws-tcp/examples/h2-server.rs`](server/crates/ws-tcp/examples/h2-server.rs):
 
@@ -184,8 +216,9 @@ Server push: pass `onPush` in `ConnectOptions`.
 
 | Function | Purpose |
 |---|---|
-| `accept(&mut req) -> (Response, impl Future<UpgradedIo>)` | WebSocket handshake for any hyper route (item 4); echoes the `h2ts` subprotocol when offered. |
-| `accept_with(&mut req, select)` | Same, but `select(&[offered]) -> Option<String>` picks which offered subprotocol to echo. |
+| `accept(&mut req) -> (Response, impl Future<UpgradedIo>)` | WebSocket handshake for any hyper route (item 4); echoes `h2ts`, and **rejects** a client that doesn't offer it (`err.rejection_response()` → `400`). |
+| `accept_with(&mut req, select)` | Same, but `select(&[offered]) -> Option<String>` picks which offered subprotocol to echo (declining still requires `h2ts`). |
+| `accept_with_options(&mut req, select, AcceptOptions)` | Same, plus `allow_implicit_codec`: accept the client's first offered codec instead of rejecting when it didn't offer `h2ts`. |
 | `offered_protocols(&req) -> Vec<&str>` | The subprotocols the client offered, in order. |
 | `serve_h2(ws_io, service)` | Serve any hyper `Service` as HTTP/2 over the tunnel (item 2). |
 | `bridge(ws_io, peer)` | Full-duplex byte pump WS ⇄ peer (item 3 core). |
