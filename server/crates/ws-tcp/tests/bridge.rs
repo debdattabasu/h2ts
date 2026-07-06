@@ -1,0 +1,167 @@
+//! `bridge()` — the raw byte pump (wslay framing on the server side), and its
+//! receive path. These drive wslay directly over an in-memory duplex, with a
+//! fastwebsockets client on the other end, and never involve HTTP/2.
+//!
+//! The receive-path tests push large / fragmented / control frames at wslay,
+//! which is the one place it must never buffer a whole frame.
+use fastwebsockets::{Frame, OpCode, Payload, Role, WebSocket};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use ws_tcp::bridge;
+
+#[tokio::test]
+async fn bridge_forwards_bytes_both_directions() {
+    let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+    let (peer_for_bridge, mut peer_test) = tokio::io::duplex(16 * 1024);
+
+    // Server side: the raw stream straight into the wslay bridge.
+    tokio::spawn(async move {
+        let _ = bridge(server_io, peer_for_bridge).await;
+    });
+    let mut client_ws = WebSocket::after_handshake(client_io, Role::Client);
+
+    // A client WS frame becomes peer bytes.
+    client_ws
+        .write_frame(Frame::binary(Payload::Owned(b"hello".to_vec())))
+        .await
+        .unwrap();
+    let mut buf = [0u8; 5];
+    peer_test.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"hello");
+
+    // Peer bytes become a binary WS frame.
+    peer_test.write_all(b"world").await.unwrap();
+    let frame = client_ws.read_frame().await.unwrap();
+    assert_eq!(frame.payload.to_vec(), b"world".to_vec());
+}
+
+#[tokio::test]
+async fn bridge_streams_a_large_payload() {
+    let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+    let (peer_for_bridge, mut peer_test) = tokio::io::duplex(16 * 1024);
+
+    tokio::spawn(async move {
+        let _ = bridge(server_io, peer_for_bridge).await;
+    });
+
+    // 512 KiB from peer -> client, larger than the duplex buffer, so it must
+    // stream across many WS frames without deadlocking.
+    let payload: Vec<u8> = (0..512 * 1024).map(|i| (i % 251) as u8).collect();
+    let expected = payload.clone();
+    tokio::spawn(async move {
+        peer_test.write_all(&payload).await.unwrap();
+    });
+
+    let mut client_ws = WebSocket::after_handshake(client_io, Role::Client);
+    let mut got = Vec::new();
+    while got.len() < expected.len() {
+        let frame = client_ws.read_frame().await.unwrap();
+        got.extend_from_slice(&frame.payload);
+    }
+    assert_eq!(got, expected);
+}
+
+/// A single inbound frame far larger than wslay's 64 KiB read chunk must be
+/// streamed across many socket reads — exercising the recv WOULDBLOCK + resume
+/// loop, client->server unmasking, and delivery to the peer without ever
+/// buffering the whole frame. This is the property wslay exists for.
+#[tokio::test]
+async fn bridge_reassembles_a_large_inbound_frame() {
+    let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+    let (peer_for_bridge, mut peer_test) = tokio::io::duplex(16 * 1024);
+
+    tokio::spawn(async move {
+        let _ = bridge(server_io, peer_for_bridge).await;
+    });
+
+    // 256 KiB = 4x the read chunk, sent as ONE WebSocket binary frame. The 16 KiB
+    // duplex forces it to arrive in many small reads, so wslay must resume a
+    // partial frame repeatedly.
+    let payload: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+    let expected = payload.clone();
+    let mut client_ws = WebSocket::after_handshake(client_io, Role::Client);
+    tokio::spawn(async move {
+        client_ws
+            .write_frame(Frame::binary(Payload::Owned(payload)))
+            .await
+            .unwrap();
+    });
+
+    let mut got = vec![0u8; expected.len()];
+    peer_test.read_exact(&mut got).await.unwrap();
+    assert_eq!(got, expected, "every byte of the large frame must reach the peer, in order");
+}
+
+/// Several complete frames can land in a single read. wslay must decode all of
+/// them in one recv pass and forward their payloads concatenated, in order.
+#[tokio::test]
+async fn bridge_handles_many_frames_in_one_read() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let (peer_for_bridge, mut peer_test) = tokio::io::duplex(64 * 1024);
+
+    tokio::spawn(async move {
+        let _ = bridge(server_io, peer_for_bridge).await;
+    });
+
+    let mut expected = Vec::new();
+    let mut client_ws = WebSocket::after_handshake(client_io, Role::Client);
+    for i in 0..64u32 {
+        let msg = format!("frame-{i:04}-");
+        expected.extend_from_slice(msg.as_bytes());
+        client_ws
+            .write_frame(Frame::binary(Payload::Owned(msg.into_bytes())))
+            .await
+            .unwrap();
+    }
+
+    let mut got = vec![0u8; expected.len()];
+    peer_test.read_exact(&mut got).await.unwrap();
+    assert_eq!(got, expected, "all frames forwarded once, in order");
+}
+
+/// wslay auto-answers a ping with a pong carrying the same payload, and does NOT
+/// leak the control-frame payload to the peer.
+#[tokio::test]
+async fn bridge_answers_ping_with_pong() {
+    let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+    // Keep `_peer_test` bound so the peer side never EOFs and tears the bridge
+    // down before the ping is handled.
+    let (peer_for_bridge, _peer_test) = tokio::io::duplex(16 * 1024);
+
+    tokio::spawn(async move {
+        let _ = bridge(server_io, peer_for_bridge).await;
+    });
+
+    let mut client_ws = WebSocket::after_handshake(client_io, Role::Client);
+    client_ws
+        .write_frame(Frame::new(
+            true,
+            OpCode::Ping,
+            None,
+            Payload::Owned(b"ping-payload".to_vec()),
+        ))
+        .await
+        .unwrap();
+
+    let frame = client_ws.read_frame().await.unwrap();
+    assert_eq!(frame.opcode, OpCode::Pong);
+    assert_eq!(frame.payload.to_vec(), b"ping-payload".to_vec());
+}
+
+/// A client-initiated close travels through wslay and shuts down the peer, which
+/// observes EOF.
+#[tokio::test]
+async fn bridge_propagates_client_close_to_peer() {
+    let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+    let (peer_for_bridge, mut peer_test) = tokio::io::duplex(16 * 1024);
+
+    tokio::spawn(async move {
+        let _ = bridge(server_io, peer_for_bridge).await;
+    });
+
+    let mut client_ws = WebSocket::after_handshake(client_io, Role::Client);
+    client_ws.write_frame(Frame::close(1000, b"")).await.unwrap();
+
+    let mut buf = [0u8; 16];
+    let n = peer_test.read(&mut buf).await.unwrap();
+    assert_eq!(n, 0, "peer should observe EOF after the client close");
+}
