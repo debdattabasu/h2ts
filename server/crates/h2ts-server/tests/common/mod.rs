@@ -21,8 +21,9 @@ use http::header::{
 };
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::Incoming;
-use hyper::server::conn::http1;
+use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
+use hyper::upgrade::Upgraded;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -170,6 +171,27 @@ pub async fn start_server() -> SocketAddr {
     addr
 }
 
+/// Start a **plain h2c** (prior-knowledge HTTP/2 over cleartext TCP) server on an
+/// ephemeral port; returns its address. This is the upstream the `h2ts-proxy`
+/// binary forwards raw bytes to — the mirror of what the `serve_h2` path serves
+/// in-process.
+pub async fn start_h2c_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let io = TokioIo::new(socket);
+                let _ = http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(io, service_fn(app))
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
 /// Perform the WebSocket handshake and return an HTTP/2 client over the tunnel.
 /// `offer` is the list of subprotocols to advertise (empty = none).
 pub async fn connect_h2(
@@ -237,6 +259,48 @@ pub async fn handshake_status(addr: SocketAddr, offer: &[&str]) -> hyper::Status
     }
     let req = builder.body(Empty::<Bytes>::new()).unwrap();
     sender.send_request(req).await.unwrap().status()
+}
+
+/// A TCP server that accepts connections and holds them open — draining and
+/// discarding anything sent, never writing or closing. Useful as a proxy upstream
+/// when a test wants **no** upstream-originated traffic (e.g. observing keepalive
+/// frames in isolation, without an h2c server's SETTINGS preface in the way).
+pub async fn start_quiet_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                while matches!(socket.read(&mut buf).await, Ok(n) if n > 0) {}
+            });
+        }
+    });
+    addr
+}
+
+/// Perform the WebSocket handshake and return the *raw* client `WebSocket` (not
+/// wrapped in HTTP/2), for observing control frames — pings, pongs, closes — as
+/// they arrive. `offer` is the list of subprotocols to advertise.
+pub async fn connect_ws_raw(addr: SocketAddr, offer: &[&str]) -> WebSocket<TokioIo<Upgraded>> {
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri(format!("http://{addr}/"))
+        .header("Host", addr.to_string())
+        .header(UPGRADE, "websocket")
+        .header(CONNECTION, "upgrade")
+        .header(SEC_WEBSOCKET_KEY, fastwebsockets::handshake::generate_key())
+        .header(SEC_WEBSOCKET_VERSION, "13");
+    if !offer.is_empty() {
+        builder = builder.header(SEC_WEBSOCKET_PROTOCOL, offer.join(", "));
+    }
+    let req = builder.body(Empty::<Bytes>::new()).unwrap();
+    let (ws, _resp) = fastwebsockets::handshake::client(&TokioExecutor::new(), req, tcp)
+        .await
+        .unwrap();
+    ws
 }
 
 /// A simple GET request over the tunnel.

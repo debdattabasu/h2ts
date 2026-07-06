@@ -5,9 +5,12 @@ import { openWebSocket, webSocketTransport, type WebSocketLike } from "./transpo
 import type { ConnectOptions } from "./types.js";
 
 /**
- * Create an HTTP/2 client over any byte-duplex {@link Transport}. The client
- * sends the connection preface + SETTINGS immediately; `request()` may be
- * called right away (it internally waits for the preface to flush).
+ * Create an HTTP/2 client over any byte-duplex {@link Transport}, speaking HTTP/2
+ * with **prior knowledge** (RFC 7540 §3.4): it sends the connection preface +
+ * SETTINGS immediately and starts issuing requests right away — no HTTP/1.1
+ * `Upgrade: h2c` negotiation, and no waiting for the server's preface (no
+ * round-trip). `request()` may be called immediately; it only waits for the
+ * client's own opening flight to flush, not for any server response.
  */
 export function connect(transport: Transport, options?: ConnectOptions): H2Connection {
   return new H2Connection(transport, options);
