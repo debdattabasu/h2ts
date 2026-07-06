@@ -1,0 +1,30 @@
+# Rust workspace for h2ts.
+#
+#   h2ts-client — library: a from-scratch HTTP/2 client (no hyper/tokio) for Rust
+#                 WASM frontends, tunneled over a WebSocket. Port of the TS client.
+#   h2ts-server — library: make a WebSocket look like raw TCP (AsyncRead+AsyncWrite);
+#                 framing by wslay (vendored C via wslay-sys), true sub-frame streaming.
+#   h2ts-proxy  — binary (ships with h2ts-server): terminate a WebSocket and forward
+#                 raw bytes to an upstream h2c server (drop-in replacement for websockify).
+#   wslay-sys   — FFI bindings to the vendored wslay C library.
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+sha1 = "0.10"
+base64 = "0.22"
+anyhow = "1"
+# Dev-only: drives the server in the Rust integration tests (a stand-in for the
+# real TS client). Not a runtime dependency of the library.
+fastwebsockets = { version = "0.10", features = ["upgrade", "unstable-split"] }

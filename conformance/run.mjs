@@ -1,8 +1,8 @@
-// End-to-end: h2ts client (built dist) --ws--> h2ts-proxy --tcp--> Node h2c origin.
-// Start the stack first (see README): the h2c origin (test/e2e/origin.mjs on
+// Conformance: h2ts client (built dist) --ws--> h2ts-proxy --tcp--> Node h2c origin.
+// Start the stack first (see README): the h2c origin (conformance/origin.mjs on
 // :8000) and h2ts-proxy (WS gateway on :8091). Point WS_URL at another gateway to
 // test it instead — e.g. the in-process `h2-server` serve_h2 example.
-import { connectWebSocket } from "../../dist/index.js";
+import { connectWebSocket } from "../typescript/client/dist/index.js";
 
 const WS_URL = process.env.WS_URL || "ws://127.0.0.1:8091";
 const AUTH = "127.0.0.1:8000";

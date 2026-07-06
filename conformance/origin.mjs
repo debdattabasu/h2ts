@@ -11,6 +11,9 @@ const HOST = "127.0.0.1";
 const server = http2.createServer();
 
 server.on("stream", (stream, headers) => {
+  // A gateway teardown resets streams abruptly; swallow those so Node doesn't
+  // throw on an unhandled stream 'error'.
+  stream.on("error", () => {});
   const method = headers[":method"];
   const path = headers[":path"];
 
@@ -58,6 +61,7 @@ server.on("stream", (stream, headers) => {
 });
 
 server.on("sessionError", (err) => console.error("[origin] sessionError:", err.message));
+server.on("error", (err) => console.error("[origin] server error:", err.message));
 server.listen(PORT, HOST, () => {
   console.error(`[origin] h2c echo server on tcp://${HOST}:${PORT}`);
 });

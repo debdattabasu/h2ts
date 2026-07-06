@@ -1,0 +1,8 @@
+{
+  "name": "@h2ts/server",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Node.js server for h2ts — terminate the WebSocket tunnel and serve/proxy HTTP/2. (not yet implemented)",
+  "type": "module",
+  "license": "MIT"
+}

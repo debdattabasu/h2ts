@@ -1,0 +1,7 @@
+{
+  "name": "h2ts-typescript",
+  "version": "0.0.0",
+  "private": true,
+  "description": "TypeScript/Node workspace for h2ts: the client (`h2ts`) and the server (`@h2ts/server`).",
+  "workspaces": ["client", "server"]
+}

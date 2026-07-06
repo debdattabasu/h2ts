@@ -263,6 +263,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "h2ts-client"
+version = "0.0.0"
+
+[[package]]
 name = "h2ts-server"
 version = "0.1.0"
 dependencies = [

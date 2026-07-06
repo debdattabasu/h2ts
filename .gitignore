@@ -1,17 +1,13 @@
-# Dependencies
-/node_modules/
+# Dependencies (npm workspace under typescript/)
+node_modules/
 
 # Build output
-/dist/
-/server/target/
+dist/
+/rust/target/
 *.tsbuildinfo
 
 # Test coverage
 /coverage/
-
-# Vendored HTTP/2 reference implementation — used only as a dev reference,
-# not part of this project and not shipped.
-/http2.js/
 
 # Local Claude Code / agent state (permissions, etc.)
 /.claude/

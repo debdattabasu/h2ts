@@ -1,0 +1,21 @@
+[package]
+name = "h2ts-client"
+version = "0.0.0" # scaffold — not yet released; bump to 0.1.0 on first publish
+edition.workspace = true
+license.workspace = true
+description = "A from-scratch HTTP/2 client (RFC 7540 + HPACK) for Rust WASM frontends, tunneled over a WebSocket. No hyper, no tokio."
+repository = "https://github.com/debdattabasu/h2ts"
+documentation = "https://docs.rs/h2ts-client"
+readme = "README.md"
+keywords = ["http2", "websocket", "wasm", "client", "frontend"]
+categories = ["network-programming", "web-programming::http-client", "wasm"]
+
+[features]
+default = ["web"]
+# Browser `WebSocket` transport via web-sys (wasm32 only). Turn OFF for host-side
+# engine tests — the protocol engine is transport-agnostic and testable natively.
+web = []
+
+[dependencies]
+
+[dev-dependencies]

@@ -4,6 +4,11 @@
   "description": "A tiny HTTP/2 client for the browser, tunneled over a WebSocket (or any byte duplex). Idiomatic TypeScript, no Node core deps.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/debdattabasu/h2ts.git",
+    "directory": "typescript/client"
+  },
   "sideEffects": false,
   "exports": {
     ".": {
@@ -19,8 +24,7 @@
     "build": "tsup",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest",
-    "e2e": "npm run build && node test/e2e/run.mjs"
+    "test:watch": "vitest"
   },
   "devDependencies": {
     "tsup": "^8.3.5",
