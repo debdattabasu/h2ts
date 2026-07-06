@@ -12,7 +12,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
-use ws_tcp::{serve_h2, AcceptOptions, WebSocketError};
+use h2ts_server::{serve_h2, AcceptOptions, WebSocketError};
 
 #[tokio::test]
 async fn h2_over_ws_full_roundtrip() {
@@ -82,7 +82,7 @@ async fn accept_with_selects_from_offered_subprotocols() {
     async fn handler(
         mut req: Request<Incoming>,
     ) -> Result<Response<Empty<Bytes>>, WebSocketError> {
-        let (response, ws_fut) = ws_tcp::accept_with(&mut req, |offered| {
+        let (response, ws_fut) = h2ts_server::accept_with(&mut req, |offered| {
             offered
                 .iter()
                 .find(|p| p.eq_ignore_ascii_case("chat"))
@@ -155,7 +155,7 @@ async fn allow_implicit_codec_accepts_any_offered_codec() {
     async fn handler(
         mut req: Request<Incoming>,
     ) -> Result<Response<Empty<Bytes>>, WebSocketError> {
-        let (response, ws_fut) = match ws_tcp::accept_with_options(
+        let (response, ws_fut) = match h2ts_server::accept_with_options(
             &mut req,
             |_offered| None,
             AcceptOptions {

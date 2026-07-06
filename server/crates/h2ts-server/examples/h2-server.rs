@@ -1,13 +1,13 @@
 //! Example: serve an in-process hyper HTTP/2 service over a WebSocket tunnel
-//! using [`ws_tcp::serve_h2`]. This is just a *caller* of the library — the
-//! reusable machinery all lives in the `ws-tcp` crate.
+//! using [`h2ts_server::serve_h2`]. This is just a *caller* of the library — the
+//! reusable machinery all lives in the `h2ts-server` crate.
 //!
 //!   browser (h2ts) --ws--> [accept -> serve_h2(ws, service)] --> your service
 //!
 //! The routes mirror the Node echo server so the h2ts e2e suite validates this
 //! pure-Rust path end to end.
 //!
-//! Run: cargo run -p ws-tcp --example h2-server -- 127.0.0.1:8092
+//! Run: cargo run -p h2ts-server --example h2-server -- 127.0.0.1:8092
 use std::convert::Infallible;
 use std::net::SocketAddr;
 
@@ -20,7 +20,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
-use ws_tcp::{accept, serve_h2};
+use h2ts_server::{accept, serve_h2};
 
 #[tokio::main]
 async fn main() -> Result<()> {

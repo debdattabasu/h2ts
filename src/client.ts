@@ -13,7 +13,7 @@ export function connect(transport: Transport, options?: ConnectOptions): H2Conne
   return new H2Connection(transport, options);
 }
 
-/** The subprotocol h2ts offers by default; the ws-tcp server echoes it. */
+/** The subprotocol h2ts offers by default; the `h2ts-server` crate echoes it. */
 export const DEFAULT_SUBPROTOCOL = "h2ts";
 
 export interface WebSocketConnectOptions extends ConnectOptions {
@@ -38,7 +38,7 @@ function offeredProtocols(extra?: string | string[]): string[] {
 /**
  * Open a WebSocket to `url`, wait for it to connect, and start an HTTP/2 client
  * tunneled over it. The far end of the WebSocket must forward raw bytes to an
- * h2c server (the `ws-tcp` server, or e.g. websockify).
+ * h2c server (the `h2ts-server` gateway, or e.g. websockify).
  *
  * Offers the `h2ts` subprotocol (plus any in `options.protocols`); the
  * negotiated one is available as {@link H2Connection.protocol}.

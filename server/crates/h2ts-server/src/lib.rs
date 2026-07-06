@@ -117,10 +117,10 @@ impl AsyncWrite for WsByteStream {
 ///
 /// Typical use in a route handler:
 /// ```ignore
-/// let (response, ws_fut) = ws_tcp::accept(&mut req)?;
+/// let (response, ws_fut) = h2ts_server::accept(&mut req)?;
 /// tokio::spawn(async move {
 ///     if let Ok(ws) = ws_fut.await {
-///         let _ = ws_tcp::serve_h2(ws, my_service).await;
+///         let _ = h2ts_server::serve_h2(ws, my_service).await;
 ///     }
 /// });
 /// Ok(response) // send the 101 back

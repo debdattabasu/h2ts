@@ -14,7 +14,7 @@ It comes in two halves that are useful independently:
 | | Package | Language | What it is |
 |---|---|---|---|
 | **Client** | `h2ts` | TypeScript | A from-scratch HTTP/2 client (RFC 7540 + HPACK/RFC 7541). ~9 KB gzipped, zero runtime deps, no `Buffer`/Node-stream polyfills. Runs in browsers and Node. |
-| **Server** | `ws-tcp` (`server/`) | Rust | Makes a WebSocket look like a TCP byte stream, so **any** HTTP/2 server can run over the tunnel — as a standalone proxy or in-process behind your routes. |
+| **Server** | `h2ts-server` (`server/`) | Rust | Makes a WebSocket look like a TCP byte stream, so **any** HTTP/2 server can run over the tunnel — as a standalone proxy or in-process behind your routes. |
 
 ---
 
@@ -23,7 +23,7 @@ It comes in two halves that are useful independently:
 ```
    ┌─────────────────────────┐        ┌──────────────────────────┐        ┌─────────────────────┐
    │  Browser / Node          │  wss   │  Rust WebSocket gateway   │  h2c   │  HTTP/2 server       │
-   │  ── h2ts client (TS) ──  │ ─────▶ │  ── ws-tcp ──────────────  │ ─────▶ │  hyper / axum / any  │
+   │  ── h2ts client (TS) ──  │ ─────▶ │  ── h2ts-server ──────────────  │ ─────▶ │  hyper / axum / any  │
    │  speaks real HTTP/2      │ frames │  WebSocket ⇄ raw TCP bytes │  TCP   │  h2c upstream        │
    └─────────────────────────┘ ◀───── └──────────────────────────┘ ◀───── └─────────────────────┘
           HPACK · multiplexing              full-duplex byte pump              plain HTTP/2 (cleartext)
@@ -52,7 +52,7 @@ The server side supports two deployment shapes:
 - **Tiny & dependency-free** — ~9 KB gzipped (28 KB minified), zero runtime dependencies. Built on `Uint8Array`/`DataView` and Web Streams — no `Buffer`, no `readable-stream`.
 - **Browser + Node** — uses the platform's native `WebSocket`.
 
-### Server (`ws-tcp`, Rust)
+### Server (`h2ts-server`, Rust)
 
 - **`WsByteStream`** — a WebSocket presented as `AsyncRead + AsyncWrite`. Anything that speaks TCP works over it unchanged.
 - **`serve_h2(ws, service)`** — run **any** `hyper::Service` (a `service_fn`, an **`axum::Router`**, a `tower` service) as HTTP/2 over the tunnel.
@@ -107,7 +107,7 @@ Use `connect(transport, options)` if you already have a byte-duplex `Transport` 
 
 ```bash
 cd server
-cargo run -p ws-tcp --bin h2ts-proxy -- 127.0.0.1:8091 127.0.0.1:8000 30
+cargo run -p h2ts-server --bin h2ts-proxy -- 127.0.0.1:8091 127.0.0.1:8000 30
 #                                        └ listen (ws)   └ upstream h2c   └ keepalive secs (0/omit = off)
 ```
 
@@ -116,10 +116,10 @@ Now `connectWebSocket("ws://127.0.0.1:8091", …)` reaches the HTTP/2 server on 
 ### Server — in-process, wrap any hyper service
 
 ```rust
-use ws_tcp::{accept, serve_h2};
+use h2ts_server::{accept, serve_h2};
 
 // In a hyper/axum route handler:
-async fn on_ws(mut req: Request<Incoming>) -> Result<Response<Empty<Bytes>>, ws_tcp::WebSocketError> {
+async fn on_ws(mut req: Request<Incoming>) -> Result<Response<Empty<Bytes>>, h2ts_server::WebSocketError> {
     let (response, ws_fut) = accept(&mut req)?;         // 101 back to the client
     tokio::spawn(async move {
         if let Ok(ws) = ws_fut.await {
@@ -132,16 +132,16 @@ async fn on_ws(mut req: Request<Incoming>) -> Result<Response<Empty<Bytes>>, ws_
 ```
 
 You don't have to run HTTP/2 over it. The same upgraded `ws` is also available as a
-**naked byte stream** — [`WsByteStream::new(ws)`](server/crates/ws-tcp/src/lib.rs) is
+**naked byte stream** — [`WsByteStream::new(ws)`](server/crates/h2ts-server/src/lib.rs) is
 `AsyncRead + AsyncWrite`, so pipe it into anything that speaks TCP (or use
-[`bridge(ws, peer)`](server/crates/ws-tcp/src/wslay.rs) to pump it straight to a
+[`bridge(ws, peer)`](server/crates/h2ts-server/src/wslay.rs) to pump it straight to a
 peer socket).
 
 For control over the WebSocket itself, swap in the `_with_config` variants
 (`serve_h2_with` / `WsByteStream::with_config` / `bridge_with`) and pass a `BridgeConfig`:
 
 ```rust
-use ws_tcp::{serve_h2_with, control_channel, BridgeConfig, CloseFrame, KeepAlive};
+use h2ts_server::{serve_h2_with, control_channel, BridgeConfig, CloseFrame, KeepAlive};
 use std::time::Duration;
 
 let (control, control_rx) = control_channel(); // send ping/pong/close from any task
@@ -160,14 +160,14 @@ let _ = serve_h2_with(ws, my_service, config).await;
 
 `on_close` fires exactly once with *why* the tunnel ended — the peer's close, a keepalive
 timeout, or `1006` abnormal. Keepalive is opt-in; omit it (or set `keepalive: None`) to
-disable and drive ping/pong yourself via `control`. See the [API table](#server-ws-tcp)
+disable and drive ping/pong yourself via `control`. See the [API table](#server-h2ts-server)
 and the control-frame notes below it.
 
-A runnable version lives in [`server/crates/ws-tcp/examples/h2-server.rs`](server/crates/ws-tcp/examples/h2-server.rs):
+A runnable version lives in [`server/crates/h2ts-server/examples/h2-server.rs`](server/crates/h2ts-server/examples/h2-server.rs):
 
 ```bash
 cd server
-cargo run -p ws-tcp --example h2-server -- 127.0.0.1:8092
+cargo run -p h2ts-server --example h2-server -- 127.0.0.1:8092
 ```
 
 ---
@@ -212,7 +212,7 @@ cargo build --release
 
 Server push: pass `onPush` in `ConnectOptions`.
 
-### Server (`ws-tcp`)
+### Server (`h2ts-server`)
 
 | Function | Purpose |
 |---|---|
@@ -233,16 +233,16 @@ Keepalive matters because a browser's JavaScript `WebSocket` **cannot send pings
 ```rust
 use std::time::Duration;
 
-let (control, control_rx) = ws_tcp::control_channel();
-let config = ws_tcp::BridgeConfig {
+let (control, control_rx) = h2ts_server::control_channel();
+let config = h2ts_server::BridgeConfig {
     // Ping an idle client every 30s; close it if no response in 10s.
-    keepalive: Some(ws_tcp::KeepAlive::new(Duration::from_secs(30), Duration::from_secs(10))),
+    keepalive: Some(h2ts_server::KeepAlive::new(Duration::from_secs(30), Duration::from_secs(10))),
     on_close: Some(Box::new(|cf| eprintln!("tunnel closed: {} {:?}", cf.code, cf.reason))),
     on_pong:  Some(Box::new(|p| { /* measure RTT */ })),
     control:  Some(control_rx),           // or drive pings yourself, keepalive: None
     ..Default::default()
 };
-tokio::spawn(ws_tcp::serve_h2_with(ws, service, config));
+tokio::spawn(h2ts_server::serve_h2_with(ws, service, config));
 control.ping(b"are you there?".to_vec())?;   // send a control frame any time
 ```
 
@@ -261,7 +261,7 @@ h2ts/
 ├── test/                       # vitest unit tests + Node↔Rust e2e (test/e2e)
 ├── server/                     # Rust workspace
 │   └── crates/
-│       ├── ws-tcp/             #   the library + h2ts-proxy binary
+│       ├── h2ts-server/             #   the library + h2ts-proxy binary
 │       │   ├── src/bin/        #     h2ts-proxy (standalone WS→h2c proxy)
 │       │   ├── examples/       #     h2-server (in-process demo)
 │       │   └── tests/          #     native integration tests
@@ -286,7 +286,7 @@ cd server && cargo test     # unit + integration: bridge, WsByteStream, full h2-
 # End-to-end: h2ts client ↔ Rust server (no mocks)
 npm run build
 node poc/server.cjs &                                        # h2c echo server on :8000
-cargo run -p ws-tcp --bin h2ts-proxy -- 127.0.0.1:8091 127.0.0.1:8000 &   # WS gateway on :8091
+cargo run -p h2ts-server --bin h2ts-proxy -- 127.0.0.1:8091 127.0.0.1:8000 &   # WS gateway on :8091
 WS_URL=ws://127.0.0.1:8091 node test/e2e/run.mjs
 ```
 
@@ -298,10 +298,10 @@ The e2e suite exercises the real path: routing, JSON, byte-exact uploads/downloa
 
 - [x] HTTP/2 client (framing, HPACK, flow control, multiplexing, push)
 - [x] WebSocket transport + `fetch`-like API
-- [x] Rust `ws-tcp`: `accept`, `bridge`, `WsByteStream`, `serve_h2`
+- [x] Rust `h2ts-server`: `accept`, `bridge`, `WsByteStream`, `serve_h2`
 - [x] `h2ts-proxy` standalone proxy
 - [x] **`wslay` framing** (vendored C via `wslay-sys`) — the sole, default backend: true sub-frame streaming (never buffers a whole frame), with an in-crate RFC 6455 handshake (`sha1` + `base64`) and no pure-Rust WebSocket framing dependency.
-- [ ] Publish `h2ts` to npm; publish `ws-tcp` to crates.io
+- [ ] Publish `h2ts` to npm; publish `h2ts-server` to crates.io
 
 ---
 

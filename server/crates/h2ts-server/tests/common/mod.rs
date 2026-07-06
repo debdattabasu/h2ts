@@ -28,7 +28,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use ws_tcp::{accept, serve_h2, WebSocketError};
+use h2ts_server::{accept, serve_h2, WebSocketError};
 
 // --- Client-side WebSocket → byte-stream adapter -------------------------
 //

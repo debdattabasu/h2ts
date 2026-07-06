@@ -73,7 +73,7 @@ impl WebSocketError {
     /// to `500` for completeness.)
     ///
     /// ```ignore
-    /// let (response, ws_fut) = match ws_tcp::accept(&mut req) {
+    /// let (response, ws_fut) = match h2ts_server::accept(&mut req) {
     ///     Ok(pair) => pair,
     ///     Err(err) => return Ok(err.rejection_response()), // send the 4xx back
     /// };
@@ -284,7 +284,7 @@ where
 ///
 /// ```ignore
 /// // Prefer "chat" if the client offered it, otherwise fall back to h2ts.
-/// let (response, ws_fut) = ws_tcp::accept_with(&mut req, |offered| {
+/// let (response, ws_fut) = h2ts_server::accept_with(&mut req, |offered| {
 ///     offered.iter().find(|p| p.eq_ignore_ascii_case("chat")).map(|p| p.to_string())
 /// })?;
 /// ```

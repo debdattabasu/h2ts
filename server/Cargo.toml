@@ -1,13 +1,13 @@
 # Rust server-side workspace for h2ts.
 #
-#   ws-tcp      — library: make a WebSocket look like raw TCP (AsyncRead+AsyncWrite).
+#   h2ts-server — library: make a WebSocket look like raw TCP (AsyncRead+AsyncWrite).
 #                 Framing is done by wslay (vendored C, via wslay-sys) for true
 #                 sub-frame streaming — it never buffers a whole frame.
 #   h2ts-proxy  — binary: terminate a WebSocket and forward raw bytes to an
 #                 upstream h2c server (a drop-in, in-Rust replacement for websockify).
 [workspace]
 resolver = "2"
-members = ["crates/ws-tcp", "crates/wslay-sys"]
+members = ["crates/h2ts-server", "crates/wslay-sys"]
 
 [workspace.package]
 edition = "2021"

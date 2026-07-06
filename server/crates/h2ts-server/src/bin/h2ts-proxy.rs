@@ -1,6 +1,6 @@
 //! h2ts-proxy — terminate a WebSocket and forward raw bytes to an upstream h2c
 //! server. A drop-in, in-Rust replacement for websockify (item 3), shipped as a
-//! binary of the `ws-tcp` crate.
+//! binary of the `h2ts-server` crate.
 //!
 //!   browser (h2ts) --ws--> [h2ts-proxy] --tcp--> upstream h2c server
 //!
@@ -26,7 +26,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::net::{TcpListener, TcpStream};
-use ws_tcp::{accept_with_options, bridge_with, AcceptOptions, BridgeConfig, KeepAlive};
+use h2ts_server::{accept_with_options, bridge_with, AcceptOptions, BridgeConfig, KeepAlive};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 

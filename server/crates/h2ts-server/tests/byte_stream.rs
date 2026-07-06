@@ -6,7 +6,7 @@ use common::client_ws_stream;
 
 use fastwebsockets::{Frame, OpCode, Payload, Role, WebSocket};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use ws_tcp::{BridgeConfig, CloseFrame, WsByteStream};
+use h2ts_server::{BridgeConfig, CloseFrame, WsByteStream};
 
 #[tokio::test]
 async fn byte_stream_reads_and_writes() {

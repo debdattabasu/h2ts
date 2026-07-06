@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use fastwebsockets::{Frame, OpCode, Payload, Role, WebSocket};
 use tokio::io::AsyncWriteExt;
-use ws_tcp::{bridge_with, control_channel, BridgeConfig, CloseFrame, KeepAlive};
+use h2ts_server::{bridge_with, control_channel, BridgeConfig, CloseFrame, KeepAlive};
 
 // --- Surfacing + sending -------------------------------------------------
 

@@ -6,7 +6,7 @@
 //! which is the one place it must never buffer a whole frame.
 use fastwebsockets::{Frame, OpCode, Payload, Role, WebSocket};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use ws_tcp::bridge;
+use h2ts_server::bridge;
 
 #[tokio::test]
 async fn bridge_forwards_bytes_both_directions() {

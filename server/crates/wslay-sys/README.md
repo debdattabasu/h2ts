@@ -4,7 +4,7 @@ Low-level Rust FFI bindings to [**wslay**](https://github.com/tatsuhiro-t/wslay)
 
 The wslay C sources are **vendored** in this crate and compiled at build time with [`cc`](https://crates.io/crates/cc); the bindings are generated with [`bindgen`](https://crates.io/crates/bindgen). No system wslay installation is required.
 
-This crate exposes wslay's event-based API verbatim — it is **`unsafe` FFI only**. For a safe, async wrapper (and a full-duplex WebSocket⇄byte-stream bridge with true sub-frame streaming), see [`ws-tcp`](https://crates.io/crates/ws-tcp).
+This crate exposes wslay's event-based API verbatim — it is **`unsafe` FFI only**. For a safe, async wrapper (and a full-duplex WebSocket⇄byte-stream bridge with true sub-frame streaming), see [`h2ts-server`](https://crates.io/crates/h2ts-server).
 
 ## Why wslay
 

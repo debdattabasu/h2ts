@@ -263,6 +263,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "h2ts-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bytes",
+ "fastwebsockets",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "sha1",
+ "tokio",
+ "wslay-sys",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -820,23 +837,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
-]
-
-[[package]]
-name = "ws-tcp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "bytes",
- "fastwebsockets",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "sha1",
- "tokio",
- "wslay-sys",
 ]
 
 [[package]]
