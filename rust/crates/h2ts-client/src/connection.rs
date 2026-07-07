@@ -337,7 +337,10 @@ struct PingWaiter {
 }
 
 struct ConnState {
-    out_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// Outbound byte sink. `destroy` drops it so the driver's write loop drains any
+    /// still-queued frames (e.g. a GOAWAY sent during a connection error) and then
+    /// ends — the peer sees the GOAWAY before the transport closes.
+    out_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
     /// Background body-upload pumps, run on the connection driver (see `request`).
     task_tx: mpsc::UnboundedSender<LocalBoxFuture<'static, ()>>,
     encoder: HpackEncoder,
@@ -359,7 +362,9 @@ struct ConnState {
 impl ConnState {
     fn write_raw(&self, bytes: Vec<u8>) {
         if !self.closed {
-            let _ = self.out_tx.unbounded_send(bytes);
+            if let Some(tx) = &self.out_tx {
+                let _ = tx.unbounded_send(bytes);
+            }
         }
     }
 
@@ -695,6 +700,9 @@ impl ConnState {
         for (_, w) in self.pings.drain() {
             let _ = w.resolve.send(Err(err.clone()));
         }
+        // Drop the outbound sender: the write loop drains whatever is still queued
+        // (a GOAWAY from `connection_error`/`close`, say) and then ends.
+        self.out_tx = None;
     }
 }
 
@@ -1008,7 +1016,7 @@ pub fn connect(
     let enable_push = options.enable_push.unwrap_or(true);
 
     let state = ConnState {
-        out_tx,
+        out_tx: Some(out_tx),
         task_tx,
         encoder: HpackEncoder::new(),
         decoder: HpackDecoder::new(header_table_size),
@@ -1093,8 +1101,21 @@ async fn drive(
     // concurrently with the read/write loops (and with one another).
     let tasks = run_tasks(task_rx);
 
+    // The write loop defines the driver's lifetime: it flushes every queued frame —
+    // including a GOAWAY queued during teardown — and ends only once `destroy` has
+    // dropped the outbound sender. read + tasks run alongside to process inbound
+    // frames and body uploads (and to trigger teardown); their completion alone does
+    // not end the driver, so the final flush is never cut short.
+    let read = read.fuse();
+    let tasks = tasks.fuse();
+    let write = write.fuse();
     futures::pin_mut!(read, write, tasks);
-    futures::future::select(futures::future::select(read, write), tasks).await;
+    futures::future::poll_fn(|cx| {
+        let _ = read.as_mut().poll(cx);
+        let _ = tasks.as_mut().poll(cx);
+        write.as_mut().poll(cx)
+    })
+    .await;
 }
 
 /// Drive registered background tasks (body-upload pumps) to completion. Never

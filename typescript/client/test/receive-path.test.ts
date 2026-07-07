@@ -72,6 +72,14 @@ class FrameReader {
     }
   }
 
+  /** The next DATA frame (skipping SETTINGS acks, WINDOW_UPDATEs, …). */
+  async nextData(): Promise<{ data: Uint8Array; endStream: boolean }> {
+    for (;;) {
+      const f = await this.next();
+      if (f.type === FrameType.DATA) return { data: f.data, endStream: f.endStream };
+    }
+  }
+
   /** Keep consuming (discarding) so the transport never back-pressures. */
   async drain(): Promise<void> {
     try {
@@ -189,5 +197,179 @@ describe("receive path: RST mid-download + trailers", () => {
     expect(res.status).toBe(200);
     expect(decodeUtf8(await res.bytes())).toBe("data");
     expect(res.trailers()).toEqual({ "grpc-status": "0" });
+  }, 8000);
+});
+
+describe("receive path: flow control + GOAWAY + framing", () => {
+  it("honors a retroactively-shrunk send window", async () => {
+    const { transport, clientReader, serverWriter } = mockTransport();
+    const conn = connect(transport);
+    const frames = new FrameReader(clientReader);
+
+    const total = 65535 + 1000;
+    const body = new Uint8Array(total);
+    const reqP = conn.request({ method: "POST", path: "/upload", authority: "e", body });
+    reqP.catch(() => {});
+
+    await frames.until((f) => f.type === FrameType.HEADERS);
+    // Take the connection window out of the picture — only the stream window gates.
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.WINDOW_UPDATE, streamId: 0, windowSizeIncrement: 1_000_000 }),
+    );
+
+    // The client sends exactly the initial 65535-byte window, then parks.
+    let sent = 0;
+    while (sent < 65535) {
+      const d = await frames.nextData();
+      expect(d.endStream).toBe(false);
+      sent += d.data.length;
+    }
+    expect(sent).toBe(65535);
+
+    // Shrink the initial window to 100 → the live stream window becomes -65435.
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.SETTINGS, streamId: 0, ack: false, settings: { initialWindowSize: 100 } }),
+    );
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.WINDOW_UPDATE, streamId: 1, windowSizeIncrement: 65445 }),
+    );
+
+    // Exactly 10 bytes released — proof the client tracked the negative window.
+    const first = await frames.nextData();
+    expect(first.data.length).toBe(10);
+    sent += first.data.length;
+
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.WINDOW_UPDATE, streamId: 1, windowSizeIncrement: 2000 }),
+    );
+    for (;;) {
+      const d = await frames.nextData();
+      sent += d.data.length;
+      if (d.endStream) break;
+    }
+    expect(sent).toBe(total);
+  }, 8000);
+
+  it("graceful GOAWAY fails higher streams but lets lower ones finish", async () => {
+    const { transport, clientReader, serverWriter } = mockTransport();
+    const conn = connect(transport);
+    const frames = new FrameReader(clientReader);
+
+    const r1 = conn.request({ path: "/a", authority: "e" });
+    const r3 = conn.request({ path: "/b", authority: "e" });
+    r3.catch(() => {});
+
+    await frames.until((f) => f.type === FrameType.HEADERS && f.streamId === 3);
+    void frames.drain();
+
+    // Graceful GOAWAY: lastStreamId 1 dooms stream 3 but not stream 1.
+    await serverWriter.write(
+      serializeFrame({
+        type: FrameType.GOAWAY,
+        streamId: 0,
+        lastStreamId: 1,
+        errorCode: 0,
+        debugData: new Uint8Array(0),
+      }),
+    );
+    await sendResponseHead(serverWriter);
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.DATA, streamId: 1, data: encodeUtf8("ok"), endStream: true }),
+    );
+
+    await expect(r3).rejects.toThrow();
+    const res1 = await r1;
+    expect(res1.status).toBe(200);
+    expect(decodeUtf8(await res1.bytes())).toBe("ok");
+  }, 8000);
+
+  it("connection-level WINDOW_UPDATE(0) tears down with a GOAWAY", async () => {
+    const { transport, clientReader, serverWriter } = mockTransport();
+    const conn = connect(transport);
+    const frames = new FrameReader(clientReader);
+
+    const reqP = conn.request({ path: "/x", authority: "e" });
+    reqP.catch(() => {});
+    await frames.until((f) => f.type === FrameType.HEADERS);
+
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.WINDOW_UPDATE, streamId: 0, windowSizeIncrement: 0 }),
+    );
+
+    // The client answers a connection error with a GOAWAY, then closes.
+    const goaway = await frames.until((f) => f.type === FrameType.GOAWAY);
+    expect(goaway.type).toBe(FrameType.GOAWAY);
+    await expect(reqP).rejects.toThrow();
+    expect(conn.isClosed).toBe(true);
+  }, 8000);
+
+  it("reassembles a header block split across CONTINUATION", async () => {
+    const { transport, clientReader, serverWriter } = mockTransport();
+    const conn = connect(transport);
+    const frames = new FrameReader(clientReader);
+
+    const reqP = conn.request({ path: "/x", authority: "e" });
+    await frames.until((f) => f.type === FrameType.HEADERS);
+    void frames.drain();
+
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.SETTINGS, streamId: 0, ack: false, settings: {} }),
+    );
+    const block = new HpackEncoder().encode([{ name: ":status", value: "200" }]);
+    const mid = Math.floor(block.length / 2);
+    await serverWriter.write(
+      serializeFrame({
+        type: FrameType.HEADERS,
+        streamId: 1,
+        headerBlockFragment: block.subarray(0, mid),
+        endStream: false,
+        endHeaders: false,
+      }),
+    );
+    await serverWriter.write(
+      serializeFrame({
+        type: FrameType.CONTINUATION,
+        streamId: 1,
+        headerBlockFragment: block.subarray(mid),
+        endHeaders: true,
+      }),
+    );
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.DATA, streamId: 1, data: new Uint8Array(0), endStream: true }),
+    );
+
+    const res = await reqP;
+    expect(res.status).toBe(200);
+  }, 8000);
+
+  it("an unterminated header block interrupted by DATA tears down with a GOAWAY", async () => {
+    const { transport, clientReader, serverWriter } = mockTransport();
+    const conn = connect(transport);
+    const frames = new FrameReader(clientReader);
+
+    const reqP = conn.request({ path: "/x", authority: "e" });
+    reqP.catch(() => {});
+    await frames.until((f) => f.type === FrameType.HEADERS);
+
+    const block = new HpackEncoder().encode([{ name: ":status", value: "200" }]);
+    // HEADERS without END_HEADERS...
+    await serverWriter.write(
+      serializeFrame({
+        type: FrameType.HEADERS,
+        streamId: 1,
+        headerBlockFragment: block,
+        endStream: false,
+        endHeaders: false,
+      }),
+    );
+    // ...then DATA instead of the required CONTINUATION.
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.DATA, streamId: 1, data: encodeUtf8("nope"), endStream: false }),
+    );
+
+    const goaway = await frames.until((f) => f.type === FrameType.GOAWAY);
+    expect(goaway.type).toBe(FrameType.GOAWAY);
+    await expect(reqP).rejects.toThrow();
+    expect(conn.isClosed).toBe(true);
   }, 8000);
 });

@@ -1018,3 +1018,349 @@ fn surfaces_response_trailers() {
         futures::join!(client, server);
     });
 }
+
+#[test]
+fn honors_a_retroactively_shrunk_send_window() {
+    // The peer lowering SETTINGS_INITIAL_WINDOW_SIZE mid-stream retroactively
+    // shrinks a live stream's send window — possibly negative (RFC 7540 §6.9.2).
+    // The client must not over-send: after the window goes negative, only a
+    // WINDOW_UPDATE that makes it positive again releases more DATA, byte-exact.
+    let mut pool = LocalPool::new();
+    let sp = pool.spawner();
+    let (transport, c2s_rx, s2c_tx) = mock_transport();
+    let (conn, driver) = connect(transport, ConnectOptions::default());
+    sp.spawn_local(driver).unwrap();
+
+    // 65535 (the initial stream window) + 1000 more to send afterwards.
+    let total = 65535usize + 1000;
+    let body = vec![0x61u8; total];
+
+    sp.spawn_local(async move {
+        let _ = conn
+            .request(RequestInit {
+                method: Some("POST".into()),
+                path: Some("/upload".into()),
+                authority: Some("example.com".into()),
+                body: body.into(),
+                ..Default::default()
+            })
+            .await;
+    })
+    .unwrap();
+
+    pool.run_until(async move {
+        let mut server = ServerSide::new(c2s_rx);
+        server.read_preface().await;
+        assert!(matches!(server.next_frame().await, Frame::Settings { .. }));
+        assert!(matches!(
+            server.next_frame().await,
+            Frame::Headers { stream_id: 1, .. }
+        ));
+        // Take the connection window out of the picture so only the *stream*
+        // window gates the upload.
+        s2c_tx
+            .unbounded_send(serialize_frame(&Frame::WindowUpdate {
+                stream_id: 0,
+                window_size_increment: 1_000_000,
+            }))
+            .unwrap();
+
+        // The client sends exactly the initial 65535-byte window, then parks.
+        let mut sent = 0usize;
+        while sent < 65535 {
+            let (d, end) = server.next_data().await;
+            assert!(!end);
+            sent += d.len();
+        }
+        assert_eq!(sent, 65535, "client sent past its initial stream window");
+
+        // Shrink the initial window to 100: the live stream window becomes
+        // 0 + (100 - 65535) = -65435 (negative).
+        s2c_tx
+            .unbounded_send(serialize_frame(&Frame::Settings {
+                ack: false,
+                settings: Settings {
+                    initial_window_size: Some(100),
+                    ..Default::default()
+                },
+            }))
+            .unwrap();
+        // Grant just enough to make it +10.
+        s2c_tx
+            .unbounded_send(serialize_frame(&Frame::WindowUpdate {
+                stream_id: 1,
+                window_size_increment: 65445,
+            }))
+            .unwrap();
+
+        // The client releases exactly 10 bytes — proof it tracked the negative window.
+        let (d, end) = server.next_data().await;
+        assert_eq!(d.len(), 10, "client ignored the retroactively-shrunk window");
+        assert!(!end);
+        sent += d.len();
+
+        // Let the remainder flow.
+        s2c_tx
+            .unbounded_send(serialize_frame(&Frame::WindowUpdate {
+                stream_id: 1,
+                window_size_increment: 2000,
+            }))
+            .unwrap();
+        loop {
+            let (d, end) = server.next_data().await;
+            sent += d.len();
+            if end {
+                break;
+            }
+        }
+        assert_eq!(sent, total);
+    });
+}
+
+#[test]
+fn graceful_goaway_fails_higher_streams_but_lets_lower_finish() {
+    // A GOAWAY(last_stream_id = N, code = 0) fails streams with id > N but leaves
+    // id <= N to complete (RFC 7540 §6.8). The connection is not torn down.
+    let mut pool = LocalPool::new();
+    let sp = pool.spawner();
+    let (transport, c2s_rx, s2c_tx) = mock_transport();
+    let (conn, driver) = connect(transport, ConnectOptions::default());
+    sp.spawn_local(driver).unwrap();
+
+    pool.run_until(async move {
+        let req1 = conn.request(RequestInit {
+            path: Some("/a".into()),
+            authority: Some("example.com".into()),
+            ..Default::default()
+        });
+        let req3 = conn.request(RequestInit {
+            path: Some("/b".into()),
+            authority: Some("example.com".into()),
+            ..Default::default()
+        });
+
+        let server = async move {
+            let mut server = ServerSide::new(c2s_rx);
+            server.read_preface().await;
+            assert!(matches!(server.next_frame().await, Frame::Settings { .. }));
+            assert!(matches!(
+                server.next_frame().await,
+                Frame::Headers { stream_id: 1, .. }
+            ));
+            assert!(matches!(
+                server.next_frame().await,
+                Frame::Headers { stream_id: 3, .. }
+            ));
+            // Graceful GOAWAY: last_stream_id = 1 dooms stream 3 but not stream 1.
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Goaway {
+                    last_stream_id: 1,
+                    error_code: 0,
+                    debug_data: Vec::new(),
+                }))
+                .unwrap();
+            // Complete stream 1.
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Settings {
+                    ack: false,
+                    settings: Settings::default(),
+                }))
+                .unwrap();
+            let block = HpackEncoder::new().encode(&[Header::new(":status", "200")]);
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Headers {
+                    stream_id: 1,
+                    header_block_fragment: block,
+                    end_stream: false,
+                    end_headers: true,
+                    priority: None,
+                }))
+                .unwrap();
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Data {
+                    stream_id: 1,
+                    data: b"ok".to_vec(),
+                    end_stream: true,
+                }))
+                .unwrap();
+        };
+
+        let (r1, r3, ()) = futures::join!(req1, req3, server);
+        assert!(r3.is_err(), "stream above lastStreamId must fail");
+        let mut r1 = r1.expect("stream at/below lastStreamId should complete");
+        assert_eq!(r1.status, 200);
+        assert_eq!(r1.text().await.unwrap(), "ok");
+    });
+}
+
+#[test]
+fn connection_window_update_zero_tears_down_with_goaway() {
+    // A connection-level WINDOW_UPDATE with a 0 increment is a PROTOCOL_ERROR
+    // (§6.9): the client emits GOAWAY and closes.
+    let mut pool = LocalPool::new();
+    let sp = pool.spawner();
+    let (transport, c2s_rx, s2c_tx) = mock_transport();
+    let (conn, driver) = connect(transport, ConnectOptions::default());
+    sp.spawn_local(driver).unwrap();
+
+    pool.run_until(async move {
+        let conn_probe = conn.clone();
+        let client = async move {
+            let res = conn
+                .request(RequestInit {
+                    path: Some("/x".into()),
+                    authority: Some("example.com".into()),
+                    ..Default::default()
+                })
+                .await;
+            assert!(res.is_err(), "request should error on a protocol error");
+        };
+
+        let server = async move {
+            let mut server = ServerSide::new(c2s_rx);
+            server.read_preface().await;
+            assert!(matches!(server.next_frame().await, Frame::Settings { .. }));
+            assert!(matches!(
+                server.next_frame().await,
+                Frame::Headers { stream_id: 1, .. }
+            ));
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::WindowUpdate {
+                    stream_id: 0,
+                    window_size_increment: 0,
+                }))
+                .unwrap();
+            // The client must answer a connection error with a GOAWAY.
+            assert!(matches!(server.next_frame().await, Frame::Goaway { .. }));
+        };
+
+        futures::join!(client, server);
+        assert!(conn_probe.is_closed(), "connection should be closed");
+    });
+}
+
+#[test]
+fn reassembles_a_header_block_split_across_continuation() {
+    // A response header block split across HEADERS + CONTINUATION must reassemble.
+    let mut pool = LocalPool::new();
+    let sp = pool.spawner();
+    let (transport, c2s_rx, s2c_tx) = mock_transport();
+    let (conn, driver) = connect(transport, ConnectOptions::default());
+    sp.spawn_local(driver).unwrap();
+
+    pool.run_until(async move {
+        let client = async move {
+            let res = conn
+                .request(RequestInit {
+                    path: Some("/x".into()),
+                    authority: Some("example.com".into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(res.status, 200);
+        };
+
+        let server = async move {
+            let mut server = ServerSide::new(c2s_rx);
+            server.read_preface().await;
+            assert!(matches!(server.next_frame().await, Frame::Settings { .. }));
+            assert!(matches!(
+                server.next_frame().await,
+                Frame::Headers { stream_id: 1, .. }
+            ));
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Settings {
+                    ack: false,
+                    settings: Settings::default(),
+                }))
+                .unwrap();
+            // Encode :status 200 and split the block across two frames.
+            let block = HpackEncoder::new().encode(&[Header::new(":status", "200")]);
+            let mid = block.len() / 2;
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Headers {
+                    stream_id: 1,
+                    header_block_fragment: block[..mid].to_vec(),
+                    end_stream: false,
+                    end_headers: false,
+                    priority: None,
+                }))
+                .unwrap();
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Continuation {
+                    stream_id: 1,
+                    header_block_fragment: block[mid..].to_vec(),
+                    end_headers: true,
+                }))
+                .unwrap();
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Data {
+                    stream_id: 1,
+                    data: Vec::new(),
+                    end_stream: true,
+                }))
+                .unwrap();
+        };
+
+        futures::join!(client, server);
+    });
+}
+
+#[test]
+fn an_unterminated_header_block_interrupted_by_data_is_a_protocol_error() {
+    // While a header block is pending (HEADERS without END_HEADERS), only a
+    // CONTINUATION may follow (§6.2). A DATA frame there is a PROTOCOL_ERROR.
+    let mut pool = LocalPool::new();
+    let sp = pool.spawner();
+    let (transport, c2s_rx, s2c_tx) = mock_transport();
+    let (conn, driver) = connect(transport, ConnectOptions::default());
+    sp.spawn_local(driver).unwrap();
+
+    pool.run_until(async move {
+        let conn_probe = conn.clone();
+        let client = async move {
+            let res = conn
+                .request(RequestInit {
+                    path: Some("/x".into()),
+                    authority: Some("example.com".into()),
+                    ..Default::default()
+                })
+                .await;
+            assert!(res.is_err(), "request should error on a protocol error");
+        };
+
+        let server = async move {
+            let mut server = ServerSide::new(c2s_rx);
+            server.read_preface().await;
+            assert!(matches!(server.next_frame().await, Frame::Settings { .. }));
+            assert!(matches!(
+                server.next_frame().await,
+                Frame::Headers { stream_id: 1, .. }
+            ));
+            let block = HpackEncoder::new().encode(&[Header::new(":status", "200")]);
+            // HEADERS without END_HEADERS...
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Headers {
+                    stream_id: 1,
+                    header_block_fragment: block,
+                    end_stream: false,
+                    end_headers: false,
+                    priority: None,
+                }))
+                .unwrap();
+            // ...then a DATA frame instead of the required CONTINUATION.
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Data {
+                    stream_id: 1,
+                    data: b"nope".to_vec(),
+                    end_stream: false,
+                }))
+                .unwrap();
+            assert!(matches!(server.next_frame().await, Frame::Goaway { .. }));
+        };
+
+        futures::join!(client, server);
+        assert!(conn_probe.is_closed(), "connection should be closed");
+    });
+}

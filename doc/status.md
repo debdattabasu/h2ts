@@ -240,7 +240,9 @@ does the right thing"* — using the same mock-server harness as the P1.1 test.
   `ping_errors_when_the_connection_closes_in_flight` (tests/connection.rs). Suites
   green: TS 32, Rust client 36. **Behavior change:** TS `ping()` now rejects on
   close instead of resolving `-1` (pre-1.0, and `-1` was an undocumented footgun).
-- [~] **P2** Receive-path reconciliation — _in progress._ See the P2 detail section.
+- [x] **P2** Receive-path reconciliation — _done 2026-07-07._ All 6 items reconciled +
+  tested in both clients; one shared bug (dropped GOAWAY on connection error) fixed in
+  both. See the P2 detail section.
   - _Round 1 (done):_ **RST_STREAM mid-upload** and **GOAWAY(error) teardown** pinned
     in both clients (Rust `rst_stream_mid_upload_fails_the_request_without_hanging`,
     `goaway_with_error_tears_down_and_fails_in_flight_requests`; TS
@@ -255,6 +257,24 @@ does the right thing"* — using the same mock-server harness as the P1.1 test.
     clients (`rst_stream_mid_download_errors_the_response_body`,
     `surfaces_response_trailers`; TS mirrors). Call sites updated (client tests +
     `h2ts-conformance`). Rust client tests 40, TS 36 (+ typecheck).
-  - _Remaining:_ #4 window-shrink, #1 GOAWAY graceful boundary, #3 protocol errors,
-    #5 CONTINUATION reassembly.
+  - _Round 3 (done): #4 window-shrink, #1 GOAWAY graceful boundary, #3 protocol-error
+    teardown, #5 CONTINUATION reassembly._ Mirrored tests in both clients (Rust
+    `honors_a_retroactively_shrunk_send_window`,
+    `graceful_goaway_fails_higher_streams_but_lets_lower_finish`,
+    `connection_window_update_zero_tears_down_with_goaway`,
+    `reassembles_a_header_block_split_across_continuation`,
+    `an_unterminated_header_block_interrupted_by_data_is_a_protocol_error`; TS mirrors).
+    #4 proves both clients honor a retroactively-**negative** send window (release
+    exactly the granted bytes, no over-send).
+  - _Bug found + fixed in BOTH clients: dropped GOAWAY on a connection error._ The #3
+    and #5 protocol-error tests revealed that neither client actually flushed the
+    GOAWAY it queues on a connection error before tearing the transport down — the
+    peer just saw an abrupt close (RFC 7540 §5.4.1/§6.8 say SHOULD send GOAWAY). Same
+    class of bug in both: **Rust** `drive` used `select`, so the read loop completing
+    dropped the write loop before it flushed; **TS** `destroy` called
+    `writer.close()` without waiting for the queued (un-awaited) GOAWAY write. Fixed
+    both: Rust `destroy` drops `out_tx` and the driver's write loop is now its
+    lifetime (flushes the queue, then ends); TS `destroy` chains `close()` after
+    `writeQueue`. Now both send the GOAWAY, asserted in both.
+  - _Verified:_ Rust client 45 tests, TS 41, conformance 16/16 both clients.
 - [ ] P3 Server + WS-transport gaps

@@ -526,10 +526,14 @@ export class H2Connection {
     const pingError = this.closeError ?? new H2Error("NO_ERROR", "connection closed");
     for (const { reject } of this.pings.values()) reject(pingError);
     this.pings.clear();
-    // Best-effort transport close.
-    this.writer.close().catch(() => {
-      this.writer.abort?.(err).catch(() => {});
-    });
+    // Flush whatever is still queued (e.g. a GOAWAY from connectionError/close)
+    // before closing, so the peer sees it — mirrors the Rust driver draining its
+    // write loop. Falls back to abort if the flush/close fails.
+    this.writeQueue
+      .then(() => this.writer.close())
+      .catch(() => {
+        this.writer.abort?.(err).catch(() => {});
+      });
     this.resolveClosed();
   }
 }
