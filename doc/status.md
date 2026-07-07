@@ -129,7 +129,7 @@ those paths — but **only for TS**.
    accessor** for the negotiated subprotocol — the spec says clients *SHOULD* expose it
    (`spec/protocol.md:35`); TS does, Rust doesn't.
 
-### Rust server (46 tests — strong; the P3 gaps below are now closed)
+### Rust server (48 tests — strong; the P3 gaps below are now closed)
 
 Well covered: handshake negotiation/rejection, `allow_implicit_codec`, bridge
 full-duplex, sub-frame streaming, large payloads, 16 concurrent streams, keepalive
@@ -153,8 +153,8 @@ in **P3 (A+B+C)**:
   ~~`WsControl` after bridge end (`BrokenPipe`)~~ **(done)** —
   `wscontrol_send_fails_after_the_bridge_ends`.
 - ~~item 11: the client's wasm `web.rs` WS transport~~ **(done — see structural gap #2
-  above).** **Still open (item 12):** GOAWAY/graceful h2 shutdown under active traffic,
-  and a true backpressure assertion (only byte-exactness is asserted today).
+  above).** **Item 12 — backpressure: done** (`tests/backpressure.rs`, both
+  directions). **Still open:** GOAWAY / graceful h2 shutdown under active traffic.
 
 ---
 
@@ -187,7 +187,9 @@ in **P3 (A+B+C)**:
     write-failure→`Err`; 426/500 handshake arms; GOAWAY under active traffic.
 11. Rust WS transport: `wasm-bindgen-test` for `websocket_transport` framing +
     subprotocol offering (or a non-wasm unit test of `WsSink` over a fake `WebSocket`).
-12. True backpressure assertion in the server (blocked writer, not just byte-exactness).
+12. ~~True backpressure assertion in the server (blocked writer, not just byte-exactness).~~
+    **Done** — `tests/backpressure.rs` proves both directions propagate backpressure (a
+    producer stays blocked while its consumer is paused, then drains byte-exact).
 
 ---
 
@@ -317,5 +319,12 @@ does the right thing"* — using the same mock-server harness as the P1.1 test.
   `run.sh` gained `CLIENT=wasm` and `CLIENT=all` (build wasm32 + wasm-bindgen, then run).
   **16/16 pass** against a live proxy → h2c origin, with a clean `1000` WS close from
   the real sink. Needs the `wasm32-unknown-unknown` target + `wasm-bindgen-cli`
-  (pinned 0.2.126). **Still deferred (item 12):** GOAWAY under active traffic + a true
-  backpressure assertion.
+  (pinned 0.2.126).
+- [x] **P3 (item 12)** Bridge backpressure — _done 2026-07-07._ `tests/backpressure.rs`
+  proves the byte pump **propagates** backpressure end to end rather than absorbing an
+  unbounded amount when the far consumer stalls (the other bridge tests only asserted
+  byte-exactness under normal flow). Both directions: a producer's `write` stays
+  unfinished (`JoinHandle::is_finished()` is `false`) while its consumer is paused —
+  so a regression to unbounded buffering would fail — then the full 1 MiB drains
+  byte-exact once the consumer resumes. **h2ts-server 48 tests.** The only original-
+  audit item now left open is **GOAWAY / graceful h2 shutdown under active traffic**.
