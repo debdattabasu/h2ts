@@ -4,14 +4,18 @@
 # Builds what it needs, starts the stack, runs the checks, tears down.
 #
 # By default BOTH clients run against the same proxy (the TypeScript `h2ts` and
-# the Rust `h2ts-client`). Select one with CLIENT=ts|rust|both (default both).
+# the Rust `h2ts-client`, native transport). CLIENT selects which:
+#   ts | rust | wasm | both (=ts+rust, default) | all (=ts+rust+wasm)
+# `wasm` compiles the Rust client to wasm32 and drives its REAL browser WebSocket
+# transport (src/web.rs) under Node — needs the wasm32 target + wasm-bindgen CLI.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 CLIENT="${CLIENT:-both}"
-run_ts() { [ "$CLIENT" = "ts" ] || [ "$CLIENT" = "both" ]; }
-run_rust() { [ "$CLIENT" = "rust" ] || [ "$CLIENT" = "both" ]; }
+run_ts() { [ "$CLIENT" = "ts" ] || [ "$CLIENT" = "both" ] || [ "$CLIENT" = "all" ]; }
+run_rust() { [ "$CLIENT" = "rust" ] || [ "$CLIENT" = "both" ] || [ "$CLIENT" = "all" ]; }
+run_wasm() { [ "$CLIENT" = "wasm" ] || [ "$CLIENT" = "all" ]; }
 
 if run_ts; then
   echo "==> building the TypeScript client"
@@ -21,6 +25,21 @@ fi
 if run_rust; then
   echo "==> building the Rust conformance client"
   ( cd rust && cargo build --quiet -p h2ts-conformance )
+fi
+
+if run_wasm; then
+  echo "==> building the Rust wasm client (real WebSocket transport)"
+  command -v wasm-bindgen >/dev/null || {
+    echo "wasm-bindgen CLI not found — install the matching version:" >&2
+    echo "  rustup target add wasm32-unknown-unknown" >&2
+    echo "  cargo install wasm-bindgen-cli --version 0.2.126" >&2
+    exit 1
+  }
+  ( cd rust && cargo build --quiet -p h2ts-wasm-conformance --target wasm32-unknown-unknown )
+  wasm-bindgen --target nodejs \
+    --out-dir rust/target/wasm-conformance \
+    --out-name h2ts_wasm_conformance \
+    rust/target/wasm32-unknown-unknown/debug/h2ts_wasm_conformance.wasm
 fi
 
 echo "==> building h2ts-proxy"
@@ -48,6 +67,11 @@ fi
 if run_rust; then
   echo "==> running checks (Rust client)"
   WS_URL="$WS_URL" rust/target/debug/h2ts-conformance || rc=1
+fi
+
+if run_wasm; then
+  echo "==> running checks (Rust wasm client, real WebSocket)"
+  WS_URL="$WS_URL" node conformance/wasm-run.mjs || rc=1
 fi
 
 exit "$rc"

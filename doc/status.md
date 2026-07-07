@@ -110,10 +110,15 @@ those paths — but **only for TS**.
    → h2c origin via the `h2ts-conformance` crate. (Before: conformance drove only
    `typescript/client/dist` and the Rust engine's only validation was hand-rolled
    mock-server tests — exactly the blind spot that hid the §1 bug.)
-2. **Rust WebSocket transport is completely untested.** `connect_websocket` /
-   `websocket_transport` / `WsSink` in `web.rs` are `wasm32`-only and there's no
-   `wasm-bindgen-test` dev-dep. Subprotocol offering, `arraybuffer` handling,
-   `onclose`→EOF, and the sink are unverified.
+2. ~~**Rust WebSocket transport is completely untested.**~~ **Resolved (P3 item 11).**
+   `web.rs` (`connect_websocket` / `websocket_transport` / `WsSink`) — the real
+   browser transport that ships to a wasm frontend — now runs the full shared battery
+   **compiled to wasm32** under Node (which supplies the global `WebSocket`), against a
+   live `h2ts-proxy` → h2c origin. New crate `h2ts-wasm-conformance` (cdylib) +
+   `conformance/wasm-run.mjs`; `run.sh CLIENT=wasm|all`. **16/16 pass**, and the real
+   `WsSink::poll_close` produces a clean `1000` WS close (the native fastwebsockets
+   driver logs `1006`). This exercises subprotocol offering, `arraybuffer` handling,
+   the `onmessage`/`onclose`→EOF plumbing, and the sink — the code no other test touched.
 3. **Neither client tests receive-path robustness:** GOAWAY handling, RST_STREAM
    mid-stream, `WINDOW_UPDATE(0)` / flow-control errors, CONTINUATION reassembly on
    *receive*, oversized-header split on *send*, `SETTINGS INITIAL_WINDOW_SIZE`
@@ -147,9 +152,9 @@ in **P3 (A+B+C)**:
 - ~~custom `KeepAlive.close`~~ **(done)** — `keepalive_uses_a_custom_close_frame`.
   ~~`WsControl` after bridge end (`BrokenPipe`)~~ **(done)** —
   `wscontrol_send_fails_after_the_bridge_ends`.
-- **Still open (deferred, item 11/12):** the client's wasm `web.rs` WS transport
-  (needs a `wasm-bindgen-test` harness), GOAWAY/graceful h2 shutdown under active
-  traffic, and a true backpressure assertion (only byte-exactness is asserted today).
+- ~~item 11: the client's wasm `web.rs` WS transport~~ **(done — see structural gap #2
+  above).** **Still open (item 12):** GOAWAY/graceful h2 shutdown under active traffic,
+  and a true backpressure assertion (only byte-exactness is asserted today).
 
 ---
 
@@ -300,6 +305,17 @@ does the right thing"* — using the same mock-server harness as the P1.1 test.
   constructible — `hyper::Error` has no public ctor — so it's noted, not tested).
   **C (control edges):** custom `KeepAlive.close` code/reason; `WsControl` send →
   `BrokenPipe` after the bridge ends. Suite: **h2ts-server 46 tests** (was 39), clippy
-  clean, rustfmt clean. **Deferred (separate lift):** the client wasm `web.rs` WS
-  transport (item 11 — needs a `wasm-bindgen-test` harness) and a true backpressure
-  assertion (item 12).
+  clean, rustfmt clean.
+- [x] **P3 (item 11)** Wasm WebSocket transport e2e — _done 2026-07-07._ The Rust
+  client's real browser transport (`web.rs`: `connect_websocket` / `websocket_transport`
+  / `WsSink`) had **zero** coverage — the native `h2ts-conformance` driver exercises the
+  engine over a *fastwebsockets* transport, never the wasm `web-sys` one that actually
+  ships. New crate **`h2ts-wasm-conformance`** (cdylib, `#![cfg(target_arch = "wasm32")]`
+  so the native workspace build sees an empty lib) runs the same 10-check battery via
+  the real `connect_websocket`; `conformance/wasm-run.mjs` loads the
+  `wasm-bindgen --target nodejs` glue and drives it under Node (global `WebSocket`).
+  `run.sh` gained `CLIENT=wasm` and `CLIENT=all` (build wasm32 + wasm-bindgen, then run).
+  **16/16 pass** against a live proxy → h2c origin, with a clean `1000` WS close from
+  the real sink. Needs the `wasm32-unknown-unknown` target + `wasm-bindgen-cli`
+  (pinned 0.2.126). **Still deferred (item 12):** GOAWAY under active traffic + a true
+  backpressure assertion.

@@ -379,6 +379,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "h2ts-wasm-conformance"
+version = "0.0.0"
+dependencies = [
+ "futures",
+ "h2ts-client",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

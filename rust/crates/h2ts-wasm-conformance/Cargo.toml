@@ -1,0 +1,24 @@
+[package]
+name = "h2ts-wasm-conformance"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Wasm conformance driver: runs the shared battery through the Rust client's real browser WebSocket transport (web.rs / connect_websocket). wasm32 only. Not published."
+
+# A `cdylib` so `wasm-bindgen --target nodejs` can generate the JS glue. On a
+# native target the whole lib is `#![cfg(target_arch = "wasm32")]`, so the
+# workspace's normal `cargo build`/`cargo test` compile it to an empty library.
+[lib]
+crate-type = ["cdylib"]
+
+# Everything here is wasm-only: the browser `WebSocket` transport under test
+# (`h2ts-client`'s `web` feature) and the wasm-bindgen/web-sys glue. Gating the
+# deps to wasm32 keeps them out of native workspace builds entirely.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The engine + its real browser transport (default features include `web`).
+h2ts-client = { path = "../h2ts-client" }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["console"] }
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
