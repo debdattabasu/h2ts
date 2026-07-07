@@ -154,7 +154,18 @@ in **P3 (A+B+C)**:
   `wscontrol_send_fails_after_the_bridge_ends`.
 - ~~item 11: the client's wasm `web.rs` WS transport~~ **(done — see structural gap #2
   above).** **Item 12 — backpressure: done** (`tests/backpressure.rs`, both
-  directions). **Still open:** GOAWAY / graceful h2 shutdown under active traffic.
+  directions).
+- **"GOAWAY / graceful shutdown under active traffic" — not a defect; closed as
+  no-op.** GOAWAY delivery is best-effort on this tunnel exactly as it is on plain TCP
+  (hyper can't guarantee a flush before close either way). The server-side WS keepalive
+  *is* the liveness mechanism: a client that stops ponging is dropped, and a client
+  that vanishes yields a 1006 — both end the tunnel like a dead TCP connection, and the
+  client's h2 engine fails its in-flight streams and retries. Deciding to close a WS
+  (keepalive or `WsControl::close`) is deliberate operator policy, ≈ a load-balancer
+  idle timeout — the transport honoring it is correct, not a bug. A graceful-drain
+  convenience (`graceful_shutdown()` wired into `serve_h2`) is unbuilt and unneeded:
+  anyone wanting it drives hyper directly over `WsByteStream::new`. **No open defects,
+  no needed features.**
 
 ---
 
@@ -184,7 +195,9 @@ in **P3 (A+B+C)**:
 
 **Priority 3 — server + transport**
 10. Rust server: `serve_h2_with` with keepalive+hooks; abnormal-close→1006; bridge
-    write-failure→`Err`; 426/500 handshake arms; GOAWAY under active traffic.
+    write-failure→`Err`; 426/500 handshake arms — **all done (P3 A+B+C)**. (GOAWAY
+    "under active traffic" was dropped as a non-defect — see the work log; it's the
+    same best-effort-as-TCP delivery plus operator-chosen keepalive/close policy.)
 11. Rust WS transport: `wasm-bindgen-test` for `websocket_transport` framing +
     subprotocol offering (or a non-wasm unit test of `WsSink` over a fake `WebSocket`).
 12. ~~True backpressure assertion in the server (blocked writer, not just byte-exactness).~~
@@ -326,5 +339,13 @@ does the right thing"* — using the same mock-server harness as the P1.1 test.
   byte-exactness under normal flow). Both directions: a producer's `write` stays
   unfinished (`JoinHandle::is_finished()` is `false`) while its consumer is paused —
   so a regression to unbounded buffering would fail — then the full 1 MiB drains
-  byte-exact once the consumer resumes. **h2ts-server 48 tests.** The only original-
-  audit item now left open is **GOAWAY / graceful h2 shutdown under active traffic**.
+  byte-exact once the consumer resumes. **h2ts-server 48 tests.**
+- [x] **GOAWAY / graceful shutdown under active traffic — closed as a non-defect
+  (no work).** On review it isn't a gap: GOAWAY delivery is best-effort on this tunnel
+  exactly as on plain TCP; the WS keepalive already provides liveness (no-pong → drop,
+  vanish → 1006), ending the tunnel like a dead TCP connection so the client fails +
+  retries in-flight streams; and deciding to close a WS (keepalive / `WsControl::close`)
+  is deliberate operator policy (≈ an LB idle timeout), not something the transport
+  should override. A graceful-drain hook in `serve_h2` is unbuilt and unneeded (drive
+  hyper directly over `WsByteStream::new` if wanted). **Audit complete: no open defects,
+  no needed features.**
