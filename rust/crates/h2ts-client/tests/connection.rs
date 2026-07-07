@@ -231,9 +231,9 @@ fn completes_a_request_when_the_server_replies_afterwards() {
         };
 
         let (res, ()) = futures::join!(req, server);
-        let res = res.unwrap();
+        let mut res = res.unwrap();
         assert_eq!(res.status, 200);
-        assert_eq!(res.text().await, "ok");
+        assert_eq!(res.text().await.unwrap(), "ok");
     });
 }
 
@@ -355,9 +355,9 @@ fn streams_a_request_body_from_a_stream() {
         };
 
         let (res, ()) = futures::join!(req, server);
-        let res = res.unwrap();
+        let mut res = res.unwrap();
         assert_eq!(res.status, 200);
-        assert_eq!(res.text().await, "ok");
+        assert_eq!(res.text().await.unwrap(), "ok");
     });
 }
 
@@ -490,7 +490,7 @@ fn returns_the_response_before_the_upload_finishes() {
 
     pool.run_until(async move {
         let client = async move {
-            let res = conn
+            let mut res = conn
                 .request(RequestInit {
                     method: Some("POST".into()),
                     path: Some("/upload".into()),
@@ -504,7 +504,7 @@ fn returns_the_response_before_the_upload_finishes() {
             assert_eq!(res.status, 200);
             // Only now do we let the rest of the body upload.
             release_tx.send(()).unwrap();
-            assert_eq!(res.text().await, "done");
+            assert_eq!(res.text().await.unwrap(), "done");
         };
 
         let server = async move {
@@ -584,11 +584,11 @@ fn streams_the_response_body_incrementally() {
                 .await
                 .unwrap();
             assert_eq!(res.status, 200);
-            // Each server DATA frame surfaces as its own body chunk, in order.
+            // Each server DATA frame surfaces as its own body chunk (Ok), in order.
             let mut body = res.into_body();
-            assert_eq!(body.next().await.as_deref(), Some(&b"one"[..]));
-            assert_eq!(body.next().await.as_deref(), Some(&b"two"[..]));
-            assert_eq!(body.next().await.as_deref(), Some(&b"three"[..]));
+            assert_eq!(body.next().await.unwrap().unwrap(), b"one");
+            assert_eq!(body.next().await.unwrap().unwrap(), b"two");
+            assert_eq!(body.next().await.unwrap().unwrap(), b"three");
             assert!(body.next().await.is_none());
         };
 
@@ -677,7 +677,7 @@ fn finishes_upload_after_an_early_complete_response() {
 
     pool.run_until(async move {
         let client = async move {
-            let res = conn
+            let mut res = conn
                 .request(RequestInit {
                     method: Some("POST".into()),
                     path: Some("/echo".into()),
@@ -690,7 +690,7 @@ fn finishes_upload_after_an_early_complete_response() {
             assert_eq!(res.status, 200);
             // The server has ALREADY fully responded; now let the rest upload.
             release_tx.send(()).unwrap();
-            assert_eq!(res.text().await, "done");
+            assert_eq!(res.text().await.unwrap(), "done");
         };
 
         let server = async move {
@@ -771,5 +771,250 @@ fn ping_errors_when_the_connection_closes_in_flight() {
             ping.await.is_err(),
             "ping should error when the connection closes in flight"
         );
+    });
+}
+
+#[test]
+fn rst_stream_mid_upload_fails_the_request_without_hanging() {
+    // The peer resets the stream while the client is still uploading. The request
+    // must resolve with an error and the body pump must stop — never hang.
+    let mut pool = LocalPool::new();
+    let sp = pool.spawner();
+    let (transport, c2s_rx, s2c_tx) = mock_transport();
+    let (conn, driver) = connect(transport, ConnectOptions::default());
+    sp.spawn_local(driver).unwrap();
+
+    // Yields one chunk, then never produces another (upload is "in progress").
+    let body = RequestBody::stream(stream::once(async { b"part1".to_vec() }).chain(stream::pending()));
+
+    pool.run_until(async move {
+        let client = async move {
+            let res = conn
+                .request(RequestInit {
+                    method: Some("POST".into()),
+                    path: Some("/upload".into()),
+                    authority: Some("example.com".into()),
+                    body,
+                    ..Default::default()
+                })
+                .await;
+            assert!(res.is_err(), "request should error when the stream is reset");
+        };
+
+        let server = async move {
+            let mut server = ServerSide::new(c2s_rx);
+            server.read_preface().await;
+            assert!(matches!(server.next_frame().await, Frame::Settings { .. }));
+            assert!(matches!(
+                server.next_frame().await,
+                Frame::Headers { stream_id: 1, .. }
+            ));
+            let (data, _end) = server.next_data().await;
+            assert_eq!(data, b"part1");
+            // Reset the stream mid-upload (CANCEL = 0x8).
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::RstStream {
+                    stream_id: 1,
+                    error_code: 8,
+                }))
+                .unwrap();
+        };
+
+        futures::join!(client, server);
+    });
+}
+
+#[test]
+fn goaway_with_error_tears_down_and_fails_in_flight_requests() {
+    // A GOAWAY with a non-zero error code fails the in-flight request and closes
+    // the connection (RFC 7540 §6.8).
+    let mut pool = LocalPool::new();
+    let sp = pool.spawner();
+    let (transport, c2s_rx, s2c_tx) = mock_transport();
+    let (conn, driver) = connect(transport, ConnectOptions::default());
+    sp.spawn_local(driver).unwrap();
+
+    pool.run_until(async move {
+        let conn_probe = conn.clone();
+        let client = async move {
+            let res = conn
+                .request(RequestInit {
+                    path: Some("/x".into()),
+                    authority: Some("example.com".into()),
+                    ..Default::default()
+                })
+                .await;
+            assert!(res.is_err(), "request should error after a GOAWAY(error)");
+        };
+
+        let server = async move {
+            let mut server = ServerSide::new(c2s_rx);
+            server.read_preface().await;
+            assert!(matches!(server.next_frame().await, Frame::Settings { .. }));
+            assert!(matches!(
+                server.next_frame().await,
+                Frame::Headers { stream_id: 1, .. }
+            ));
+            // GOAWAY: last_stream_id 0 (so stream 1 > 0 is doomed), PROTOCOL_ERROR.
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Goaway {
+                    last_stream_id: 0,
+                    error_code: 1,
+                    debug_data: Vec::new(),
+                }))
+                .unwrap();
+        };
+
+        futures::join!(client, server);
+        assert!(
+            conn_probe.is_closed(),
+            "connection should be closed after a GOAWAY error"
+        );
+    });
+}
+
+#[test]
+fn rst_stream_mid_download_errors_the_response_body() {
+    // The head resolves, but a reset mid-body must ERROR the body (not look like a
+    // clean EOF) so a truncated download is visible — matching the TS client.
+    let mut pool = LocalPool::new();
+    let sp = pool.spawner();
+    let (transport, c2s_rx, s2c_tx) = mock_transport();
+    let (conn, driver) = connect(transport, ConnectOptions::default());
+    sp.spawn_local(driver).unwrap();
+
+    pool.run_until(async move {
+        let client = async move {
+            let mut res = conn
+                .request(RequestInit {
+                    path: Some("/download".into()),
+                    authority: Some("example.com".into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(res.status, 200);
+            // One chunk arrived, then a reset — buffering the body must error.
+            assert!(
+                res.bytes().await.is_err(),
+                "a reset mid-download must surface as a body error"
+            );
+        };
+
+        let server = async move {
+            let mut server = ServerSide::new(c2s_rx);
+            server.read_preface().await;
+            assert!(matches!(server.next_frame().await, Frame::Settings { .. }));
+            assert!(matches!(
+                server.next_frame().await,
+                Frame::Headers { stream_id: 1, .. }
+            ));
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Settings {
+                    ack: false,
+                    settings: Settings::default(),
+                }))
+                .unwrap();
+            let block = HpackEncoder::new().encode(&[Header::new(":status", "200")]);
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Headers {
+                    stream_id: 1,
+                    header_block_fragment: block,
+                    end_stream: false,
+                    end_headers: true,
+                    priority: None,
+                }))
+                .unwrap();
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Data {
+                    stream_id: 1,
+                    data: b"one".to_vec(),
+                    end_stream: false,
+                }))
+                .unwrap();
+            // Reset mid-download (CANCEL).
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::RstStream {
+                    stream_id: 1,
+                    error_code: 8,
+                }))
+                .unwrap();
+        };
+
+        futures::join!(client, server);
+    });
+}
+
+#[test]
+fn surfaces_response_trailers() {
+    // A HEADERS block after the body is trailers; the client exposes them via
+    // Response::trailers() once the body has been read.
+    let mut pool = LocalPool::new();
+    let sp = pool.spawner();
+    let (transport, c2s_rx, s2c_tx) = mock_transport();
+    let (conn, driver) = connect(transport, ConnectOptions::default());
+    sp.spawn_local(driver).unwrap();
+
+    pool.run_until(async move {
+        let client = async move {
+            let mut res = conn
+                .request(RequestInit {
+                    path: Some("/rpc".into()),
+                    authority: Some("example.com".into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(res.status, 200);
+            assert_eq!(res.bytes().await.unwrap(), b"data");
+            let trailers = res.trailers().expect("trailers should be present");
+            assert_eq!(trailers.get("grpc-status").map(String::as_str), Some("0"));
+        };
+
+        let server = async move {
+            let mut server = ServerSide::new(c2s_rx);
+            server.read_preface().await;
+            assert!(matches!(server.next_frame().await, Frame::Settings { .. }));
+            assert!(matches!(
+                server.next_frame().await,
+                Frame::Headers { stream_id: 1, .. }
+            ));
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Settings {
+                    ack: false,
+                    settings: Settings::default(),
+                }))
+                .unwrap();
+            let head = HpackEncoder::new().encode(&[Header::new(":status", "200")]);
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Headers {
+                    stream_id: 1,
+                    header_block_fragment: head,
+                    end_stream: false,
+                    end_headers: true,
+                    priority: None,
+                }))
+                .unwrap();
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Data {
+                    stream_id: 1,
+                    data: b"data".to_vec(),
+                    end_stream: false,
+                }))
+                .unwrap();
+            // Trailers: a second HEADERS block, carrying END_STREAM.
+            let trailers = HpackEncoder::new().encode(&[Header::new("grpc-status", "0")]);
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Headers {
+                    stream_id: 1,
+                    header_block_fragment: trailers,
+                    end_stream: true,
+                    end_headers: true,
+                    priority: None,
+                }))
+                .unwrap();
+        };
+
+        futures::join!(client, server);
     });
 }

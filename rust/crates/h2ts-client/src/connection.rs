@@ -111,32 +111,43 @@ impl From<&str> for RequestBody {
     }
 }
 
-/// A response. The body is a stream of byte chunks; `text`/`bytes` buffer it.
+/// A response. The body is a stream of byte-chunk results; a chunk is `Err` if the
+/// stream was reset or the connection failed mid-download, so a truncated body is
+/// never mistaken for a complete one (mirrors the TS body stream erroring).
 pub struct Response {
     pub status: u16,
     pub headers: HashMap<String, String>,
     pub raw_headers: Vec<Header>,
-    body: mpsc::UnboundedReceiver<Vec<u8>>,
+    body: mpsc::UnboundedReceiver<Result<Vec<u8>, H2Error>>,
+    /// Trailers (a HEADERS block after the body). Shared with the stream, which
+    /// fills it in when they arrive; readable once the body has ended.
+    trailers: Rc<RefCell<Option<HashMap<String, String>>>>,
 }
 
 impl Response {
-    /// The response body as a stream of chunks.
-    pub fn into_body(self) -> mpsc::UnboundedReceiver<Vec<u8>> {
+    /// The response body as a stream of chunk results (`Err` on reset/failure).
+    pub fn into_body(self) -> mpsc::UnboundedReceiver<Result<Vec<u8>, H2Error>> {
         self.body
     }
 
-    /// Buffer the whole body.
-    pub async fn bytes(mut self) -> Vec<u8> {
+    /// Buffer the whole body. Errors if the stream was reset or failed mid-download.
+    pub async fn bytes(&mut self) -> Result<Vec<u8>, H2Error> {
         let mut out = Vec::new();
         while let Some(chunk) = self.body.next().await {
-            out.extend_from_slice(&chunk);
+            out.extend_from_slice(&chunk?);
         }
-        out
+        Ok(out)
     }
 
     /// Buffer the body and decode it as UTF-8 (lossy).
-    pub async fn text(self) -> String {
-        String::from_utf8_lossy(&self.bytes().await).into_owned()
+    pub async fn text(&mut self) -> Result<String, H2Error> {
+        Ok(String::from_utf8_lossy(&self.bytes().await?).into_owned())
+    }
+
+    /// Response trailers (a HEADERS block sent after the body), or `None` if there
+    /// were none. Read the body to completion first — trailers arrive after it.
+    pub fn trailers(&self) -> Option<HashMap<String, String>> {
+        self.trailers.borrow().clone()
     }
 }
 
@@ -191,7 +202,10 @@ struct StreamState {
     id: u32,
     send_window: SendWindow,
     head_tx: Option<oneshot::Sender<Result<Head, H2Error>>>,
-    body_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    body_tx: Option<mpsc::UnboundedSender<Result<Vec<u8>, H2Error>>>,
+    /// Trailers cell shared with the `Response`; set when a post-body HEADERS block
+    /// (trailers) arrives.
+    trailers: Rc<RefCell<Option<HashMap<String, String>>>>,
     got_head: bool,
     body_closed: bool,
     /// Our send side is done (we sent END_STREAM: bodyless HEADERS, or the body
@@ -208,6 +222,7 @@ impl StreamState {
             send_window: SendWindow::new(initial_send_window),
             head_tx: None,
             body_tx: None,
+            trailers: Rc::new(RefCell::new(None)),
             got_head: false,
             body_closed: false,
             local_closed: false,
@@ -221,8 +236,10 @@ impl StreamState {
             if let Some(tx) = self.head_tx.take() {
                 let _ = tx.send(Ok(collect_headers(raw)));
             }
+        } else {
+            // A second HEADERS block on an open stream = trailers.
+            *self.trailers.borrow_mut() = Some(collect_headers(raw).headers);
         }
-        // A second HEADERS block would be trailers (not surfaced yet).
         if end_stream {
             self.end_body();
         }
@@ -231,7 +248,7 @@ impl StreamState {
     fn receive_data(&mut self, data: &[u8], end_stream: bool) {
         if !self.body_closed && !data.is_empty() {
             if let Some(tx) = &self.body_tx {
-                let _ = tx.unbounded_send(data.to_vec());
+                let _ = tx.unbounded_send(Ok(data.to_vec()));
             }
         }
         if end_stream {
@@ -253,10 +270,16 @@ impl StreamState {
         if !self.got_head {
             self.got_head = true;
             if let Some(tx) = self.head_tx.take() {
-                let _ = tx.send(Err(err));
+                let _ = tx.send(Err(err.clone()));
             }
         }
-        // Dropping the body sender ends the body stream (EOF). (TS errors it.)
+        // Error the body (if still open) so a reset/failed download surfaces rather
+        // than looking like a clean EOF — matching the TS body stream erroring.
+        if !self.body_closed {
+            if let Some(tx) = &self.body_tx {
+                let _ = tx.unbounded_send(Err(err));
+            }
+        }
         self.end_body();
     }
 
@@ -698,6 +721,7 @@ impl H2Connection {
         let head_rx;
         let body_rx;
         let task_tx;
+        let trailers;
         {
             let mut st = self.shared.borrow_mut();
             if st.closed {
@@ -723,6 +747,7 @@ impl H2Connection {
             stream.body_tx = Some(btx);
             // A bodyless request half-closes immediately (HEADERS carries END_STREAM).
             stream.local_closed = !has_body;
+            trailers = stream.trailers.clone();
             st.streams.insert(id, stream);
             head_rx = hrx;
             body_rx = brx;
@@ -747,6 +772,7 @@ impl H2Connection {
                 headers: head.headers,
                 raw_headers: head.raw,
                 body: body_rx,
+                trailers,
             }),
             Ok(Err(e)) => Err(e),
             Err(_canceled) => Err(self

@@ -192,10 +192,10 @@ async fn run() -> i32 {
 
     // 1. Basic GET
     match conn.request(get("/hello")).await {
-        Ok(r) => {
+        Ok(mut r) => {
             let status = r.status;
             c.check("GET /hello -> 200", status == 200, &format!("status={status}"));
-            let body = r.text().await.to_lowercase();
+            let body = r.text().await.unwrap_or_default().to_lowercase();
             c.check("GET /hello body", body.contains("hello"), "");
         }
         Err(e) => c.check("GET /hello", false, &format!("{e}")),
@@ -203,10 +203,10 @@ async fn run() -> i32 {
 
     // 2. JSON (substring checks — the client library has no JSON parser)
     match conn.request(get("/json")).await {
-        Ok(r) => {
+        Ok(mut r) => {
             let ct = r.headers.get("content-type").cloned().unwrap_or_default();
             c.check("GET /json content-type", ct == "application/json", &ct);
-            let body = r.text().await;
+            let body = r.text().await.unwrap_or_default();
             c.check(
                 "GET /json parsed",
                 body.contains("\"ok\":true") && body.contains("\"path\":\"/json\""),
@@ -227,19 +227,23 @@ async fn run() -> i32 {
         })
         .await
     {
-        Ok(r) => {
+        Ok(mut r) => {
             c.check("POST /echo -> 200", r.status == 200, "");
-            c.check("POST /echo echoes body", r.text().await == "ping-pong", "");
+            c.check(
+                "POST /echo echoes body",
+                r.text().await.unwrap_or_default() == "ping-pong",
+                "",
+            );
         }
         Err(e) => c.check("POST /echo", false, &format!("{e}")),
     }
 
     // 4. Large download (256 KiB) — inbound flow control across many DATA frames
     match conn.request(get("/big")).await {
-        Ok(r) => {
+        Ok(mut r) => {
             let x_size = r.headers.get("x-size").cloned().unwrap_or_default();
             c.check("GET /big x-size header", x_size == (256 * 1024).to_string(), &x_size);
-            let big = r.bytes().await;
+            let big = r.bytes().await.unwrap_or_default();
             c.check("GET /big size", big.len() == 256 * 1024, &format!("got {}", big.len()));
         }
         Err(e) => c.check("GET /big", false, &format!("{e}")),
@@ -250,8 +254,8 @@ async fn run() -> i32 {
     let ok_count = {
         let mut n = 0usize;
         for r in many {
-            if let Ok(r) = r {
-                if r.text().await.contains("\"ok\":true") {
+            if let Ok(mut r) = r {
+                if r.text().await.unwrap_or_default().contains("\"ok\":true") {
                     n += 1;
                 }
             }
@@ -272,14 +276,14 @@ async fn run() -> i32 {
         })
         .await
     {
-        Ok(r) => {
+        Ok(mut r) => {
             let x_echo = r.headers.get("x-echo-bytes").cloned().unwrap_or_default();
             c.check(
                 "echo x-echo-bytes header",
                 x_echo == payload.len().to_string(),
                 &x_echo,
             );
-            let echoed = r.bytes().await;
+            let echoed = r.bytes().await.unwrap_or_default();
             c.check(
                 "512KiB upload echo size",
                 echoed.len() == payload.len(),
@@ -319,7 +323,9 @@ async fn run() -> i32 {
             let mut body = r.into_body();
             let mut streamed = 0usize;
             while let Some(chunk) = body.next().await {
-                streamed += chunk.len();
+                if let Ok(chunk) = chunk {
+                    streamed += chunk.len();
+                }
             }
             c.check(
                 "streamed /big size",

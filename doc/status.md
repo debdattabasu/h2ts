@@ -119,10 +119,10 @@ those paths — but **only for TS**.
    *receive*, oversized-header split on *send*, `SETTINGS INITIAL_WINDOW_SIZE`
    mid-stream re-adjust, malformed/oversized frames.
 4. **Feature-parity gaps in the Rust client** (deferred TODOs — each is also a coverage
-   gap vs TS): trailers not surfaced (`connection.rs:218`), server push refused with no
-   callback (`connection.rs:547`), no abort/cancel (TS has `signal`), and **no
-   `protocol` accessor** for the negotiated subprotocol — the spec says clients *SHOULD*
-   expose it (`spec/protocol.md:35`); TS does, Rust doesn't.
+   gap vs TS): ~~trailers not surfaced~~ _(done — P2 Round 2)_, server push refused with
+   no callback (`connection.rs`), no abort/cancel (TS has `signal`), and **no `protocol`
+   accessor** for the negotiated subprotocol — the spec says clients *SHOULD* expose it
+   (`spec/protocol.md:35`); TS does, Rust doesn't.
 
 ### Rust server (39 tests — strong, catalogued gaps)
 
@@ -175,6 +175,39 @@ full-duplex, sub-frame streaming, large payloads, 16 concurrent streams, keepali
 
 ---
 
+## P2 — receive-path reconciliation (detail)
+
+The **receive path** is `dispatch()` reacting to inbound frames from the peer
+([connection.ts:182](../typescript/client/src/connection.ts) /
+[connection.rs:363](../rust/crates/h2ts-client/src/connection.rs)) — the least-tested
+area in both clients, and where the P1.1 bug lived. A real correctness bug sat
+undetected in this path, so the whole neighborhood needs mirrored tests that pin
+behavior and reconcile the two clients. The items below are untested gaps (plausible
+code, unproven), except trailers which is a real divergence.
+
+Goal: symmetric tests in both clients — *"peer sends `<frame>` → assert the client
+does the right thing"* — using the same mock-server harness as the P1.1 test.
+
+1. **GOAWAY** (ts:276 / rs:509). Streams with `id > lastStreamId` fail; a non-zero
+   error code tears the connection down. *Assert:* graceful GOAWAY (code 0) fails only
+   higher-id streams and lets lower ones finish; non-zero tears everything down.
+2. ~~**RST_STREAM mid-stream**~~ **(done).** mid-upload → request errors, pump stops, no
+   hang; mid-download → body **errors** (Rust reshaped to carry `Result` so it no longer
+   silently truncates). Reconciled + tested in both clients.
+3. **Protocol errors → GOAWAY + teardown** — `WINDOW_UPDATE(0)` (rs:485), frame >
+   `maxFrameSize`, CONTINUATION on the wrong stream (ts:186). *Assert:* client emits
+   GOAWAY and destroys cleanly via `connectionError` (ts:501 / rs:649) — no panic/hang.
+4. **SETTINGS INITIAL_WINDOW_SIZE mid-stream** (ts:308 / rs:576). The peer changing the
+   initial window retroactively adjusts every existing stream's send window, possibly
+   **negative** (§6.9.2). *Assert:* a stream mid-upload whose window shrank does not
+   over-send. *(highest value — data-integrity risk)*
+5. **CONTINUATION reassembly on receive** (ts:206 / rs:401). *Assert:* a header block
+   split across HEADERS + CONTINUATION reassembles; an intervening non-CONTINUATION
+   frame is rejected.
+6. ~~**Trailers**~~ **(done).** Implemented in the Rust client (`Response::trailers()`
+   via a shared cell); both clients now surface a post-body HEADERS block and are
+   tested (`surfaces_response_trailers`).
+
 ## Work log
 
 - [x] **P1.1** Fix Rust bidi upload-truncation bug + regression test — _done 2026-07-07._
@@ -207,5 +240,21 @@ full-duplex, sub-frame streaming, large payloads, 16 concurrent streams, keepali
   `ping_errors_when_the_connection_closes_in_flight` (tests/connection.rs). Suites
   green: TS 32, Rust client 36. **Behavior change:** TS `ping()` now rejects on
   close instead of resolving `-1` (pre-1.0, and `-1` was an undocumented footgun).
-- [ ] P2 Receive-path robustness tests (GOAWAY, RST, protocol errors, CONTINUATION, trailers, settings)
+- [~] **P2** Receive-path reconciliation — _in progress._ See the P2 detail section.
+  - _Round 1 (done):_ **RST_STREAM mid-upload** and **GOAWAY(error) teardown** pinned
+    in both clients (Rust `rst_stream_mid_upload_fails_the_request_without_hanging`,
+    `goaway_with_error_tears_down_and_fails_in_flight_requests`; TS
+    `test/receive-path.test.ts`). Both correct & consistent — the pump-hang risk is
+    **not** a bug.
+  - _Round 2 (done): #2 RST mid-download + #6 trailers reconciled (Rust API change)._
+    Rust `Response` body now carries `Result<Vec<u8>, H2Error>`; `bytes()`/`text()`
+    return `Result` and take `&mut self`; `StreamState::fail` sends `Err` on the body
+    channel, so a reset/failed download **errors** instead of silently truncating —
+    matching TS. Trailers implemented: a post-body HEADERS block fills a shared cell
+    exposed via `Response::trailers()` (was "not surfaced yet"). Tests added in both
+    clients (`rst_stream_mid_download_errors_the_response_body`,
+    `surfaces_response_trailers`; TS mirrors). Call sites updated (client tests +
+    `h2ts-conformance`). Rust client tests 40, TS 36 (+ typecheck).
+  - _Remaining:_ #4 window-shrink, #1 GOAWAY graceful boundary, #3 protocol errors,
+    #5 CONTINUATION reassembly.
 - [ ] P3 Server + WS-transport gaps
