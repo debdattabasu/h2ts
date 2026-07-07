@@ -10,8 +10,7 @@
 //! driver future the caller spawns.
 //!
 //! Deferred from the TS (marked `TODO`): server-push callbacks (pushes are
-//! refused), streaming *request* upload from a `Stream` (in-memory bodies work),
-//! `ping` RTT timing (needs a wasm clock), and abort signals.
+//! refused) and abort signals.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -20,7 +19,9 @@ use std::rc::Rc;
 use std::task::Poll;
 
 use futures::channel::{mpsc, oneshot};
-use futures::{future::poll_fn, SinkExt, StreamExt};
+use futures::future::{poll_fn, LocalBoxFuture};
+use futures::stream::{self, FuturesUnordered, LocalBoxStream};
+use futures::{FutureExt, SinkExt, Stream, StreamExt};
 
 use crate::errors::{ErrorCode, H2Error};
 use crate::flow::SendWindow;
@@ -30,8 +31,14 @@ use crate::transport::Transport;
 
 const CONNECTION_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const SPEC_INITIAL_WINDOW: i64 = 65535;
-const FORBIDDEN_HEADERS: [&str; 6] =
-    ["connection", "host", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"];
+const FORBIDDEN_HEADERS: [&str; 6] = [
+    "connection",
+    "host",
+    "keep-alive",
+    "proxy-connection",
+    "transfer-encoding",
+    "upgrade",
+];
 
 // --- public request/response types (port of types.ts) ---
 
@@ -43,8 +50,65 @@ pub struct RequestInit {
     pub authority: Option<String>,
     pub scheme: Option<String>,
     pub headers: Vec<(String, String)>,
-    /// In-memory request body (empty = no body). Streaming upload is a TODO.
-    pub body: Vec<u8>,
+    /// Request body. Defaults to empty; pass an in-memory buffer via `.into()`
+    /// (`Vec<u8>` / `String` / `&str`) or a chunk stream via [`RequestBody::stream`].
+    pub body: RequestBody,
+}
+
+/// A request body: nothing, an in-memory buffer, or a stream of chunks uploaded
+/// incrementally with flow control (port of the TS `BodyInit`). Build one with
+/// `RequestBody::from(..)` / `.into()` for buffers, or [`RequestBody::stream`] for
+/// any `Stream<Item = Vec<u8>>` (streaming upload).
+#[derive(Default)]
+pub enum RequestBody {
+    /// No body; the request half-closes after HEADERS.
+    #[default]
+    Empty,
+    /// A complete in-memory body, framed and flow-controlled as it is sent.
+    Bytes(Vec<u8>),
+    /// A stream of body chunks, uploaded as they arrive.
+    Stream(LocalBoxStream<'static, Vec<u8>>),
+}
+
+impl RequestBody {
+    /// Wrap any `Stream` of byte chunks as a streaming request body.
+    pub fn stream<S>(chunks: S) -> Self
+    where
+        S: Stream<Item = Vec<u8>> + 'static,
+    {
+        RequestBody::Stream(chunks.boxed_local())
+    }
+
+    /// True when there is nothing to send (so HEADERS carries END_STREAM). A
+    /// stream is assumed non-empty, matching the TS `bodyIsEmpty`.
+    fn is_empty(&self) -> bool {
+        match self {
+            RequestBody::Empty => true,
+            RequestBody::Bytes(b) => b.is_empty(),
+            RequestBody::Stream(_) => false,
+        }
+    }
+}
+
+impl From<Vec<u8>> for RequestBody {
+    fn from(v: Vec<u8>) -> Self {
+        RequestBody::Bytes(v)
+    }
+}
+impl From<&[u8]> for RequestBody {
+    fn from(v: &[u8]) -> Self {
+        RequestBody::Bytes(v.to_vec())
+    }
+}
+impl From<String> for RequestBody {
+    fn from(v: String) -> Self {
+        RequestBody::Bytes(v.into_bytes())
+    }
+}
+impl From<&str> for RequestBody {
+    fn from(v: &str) -> Self {
+        RequestBody::Bytes(v.as_bytes().to_vec())
+    }
 }
 
 /// A response. The body is a stream of byte chunks; `text`/`bytes` buffer it.
@@ -116,7 +180,11 @@ fn collect_headers(raw: Vec<Header>) -> Head {
             }
         }
     }
-    Head { status, headers, raw }
+    Head {
+        status,
+        headers,
+        raw,
+    }
 }
 
 struct StreamState {
@@ -126,6 +194,11 @@ struct StreamState {
     body_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
     got_head: bool,
     body_closed: bool,
+    /// Our send side is done (we sent END_STREAM: bodyless HEADERS, or the body
+    /// pump's terminal DATA). Until then the stream is at most half-closed.
+    local_closed: bool,
+    /// The peer's send side is done (we received END_STREAM). Likewise.
+    remote_closed: bool,
 }
 
 impl StreamState {
@@ -137,6 +210,8 @@ impl StreamState {
             body_tx: None,
             got_head: false,
             body_closed: false,
+            local_closed: false,
+            remote_closed: false,
         }
     }
 
@@ -166,7 +241,11 @@ impl StreamState {
 
     fn receive_reset(&mut self, error_code: u32) {
         let code = ErrorCode::from_value(error_code).unwrap_or(ErrorCode::ProtocolError);
-        self.fail(H2Error::stream(code, format!("stream {} reset by peer", self.id), self.id));
+        self.fail(H2Error::stream(
+            code,
+            format!("stream {} reset by peer", self.id),
+            self.id,
+        ));
     }
 
     fn fail(&mut self, err: H2Error) {
@@ -225,8 +304,19 @@ struct PendingHeaderBlock {
     fragments: Vec<Vec<u8>>,
 }
 
+/// An in-flight PING awaiting its ACK, with the send time so the round-trip time
+/// can be computed when the ACK arrives (mirrors the TS `{ resolve, sentAt }`).
+/// The channel carries a `Result` so a connection teardown can fail the waiter
+/// with the close error rather than deliver a bogus RTT.
+struct PingWaiter {
+    resolve: oneshot::Sender<Result<f64, H2Error>>,
+    sent_at: f64,
+}
+
 struct ConnState {
     out_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// Background body-upload pumps, run on the connection driver (see `request`).
+    task_tx: mpsc::UnboundedSender<LocalBoxFuture<'static, ()>>,
     encoder: HpackEncoder,
     decoder: HpackDecoder,
     frame_decoder: FrameDecoder,
@@ -235,7 +325,7 @@ struct ConnState {
     conn_send_window: SendWindow,
     remote: RemoteSettings,
     pending_header_block: Option<PendingHeaderBlock>,
-    pings: HashMap<[u8; 8], oneshot::Sender<()>>,
+    pings: HashMap<[u8; 8], PingWaiter>,
     ping_counter: u32,
     closed: bool,
     close_error: Option<H2Error>,
@@ -273,7 +363,10 @@ impl ConnState {
     fn dispatch(&mut self, frame: Frame) -> Result<(), H2Error> {
         // A pending header block only allows CONTINUATION on the same stream (§6.2).
         if self.pending_header_block.is_some() && !matches!(frame, Frame::Continuation { .. }) {
-            return Err(H2Error::new(ErrorCode::ProtocolError, "expected CONTINUATION frame"));
+            return Err(H2Error::new(
+                ErrorCode::ProtocolError,
+                "expected CONTINUATION frame",
+            ));
         }
 
         match frame {
@@ -282,9 +375,18 @@ impl ConnState {
                     return Ok(());
                 }
                 self.apply_remote_settings(&settings);
-                self.send_frame(Frame::Settings { ack: true, settings: Settings::default() });
+                self.send_frame(Frame::Settings {
+                    ack: true,
+                    settings: Settings::default(),
+                });
             }
-            Frame::Headers { stream_id, header_block_fragment, end_stream, end_headers, .. } => {
+            Frame::Headers {
+                stream_id,
+                header_block_fragment,
+                end_stream,
+                end_headers,
+                ..
+            } => {
                 self.pending_header_block = Some(PendingHeaderBlock {
                     stream_id,
                     kind: HeaderBlockKind::Response,
@@ -296,16 +398,32 @@ impl ConnState {
                     self.complete_header_block()?;
                 }
             }
-            Frame::Continuation { stream_id, header_block_fragment, end_headers } => {
+            Frame::Continuation {
+                stream_id,
+                header_block_fragment,
+                end_headers,
+            } => {
                 match &mut self.pending_header_block {
-                    Some(pb) if pb.stream_id == stream_id => pb.fragments.push(header_block_fragment),
-                    _ => return Err(H2Error::new(ErrorCode::ProtocolError, "unexpected CONTINUATION")),
+                    Some(pb) if pb.stream_id == stream_id => {
+                        pb.fragments.push(header_block_fragment)
+                    }
+                    _ => {
+                        return Err(H2Error::new(
+                            ErrorCode::ProtocolError,
+                            "unexpected CONTINUATION",
+                        ))
+                    }
                 }
                 if end_headers {
                     self.complete_header_block()?;
                 }
             }
-            Frame::PushPromise { stream_id, promised_stream_id, header_block_fragment, end_headers } => {
+            Frame::PushPromise {
+                stream_id,
+                promised_stream_id,
+                header_block_fragment,
+                end_headers,
+            } => {
                 self.pending_header_block = Some(PendingHeaderBlock {
                     stream_id,
                     kind: HeaderBlockKind::Push,
@@ -317,28 +435,51 @@ impl ConnState {
                     self.complete_header_block()?;
                 }
             }
-            Frame::Data { stream_id, data, end_stream } => {
+            Frame::Data {
+                stream_id,
+                data,
+                end_stream,
+            } => {
                 let has_stream = self.streams.contains_key(&stream_id);
                 if !data.is_empty() {
                     // Replenish on receipt (simple constant receive window).
-                    self.send_frame(Frame::WindowUpdate { stream_id: 0, window_size_increment: data.len() as u32 });
+                    self.send_frame(Frame::WindowUpdate {
+                        stream_id: 0,
+                        window_size_increment: data.len() as u32,
+                    });
                     if has_stream && !end_stream {
-                        self.send_frame(Frame::WindowUpdate { stream_id, window_size_increment: data.len() as u32 });
+                        self.send_frame(Frame::WindowUpdate {
+                            stream_id,
+                            window_size_increment: data.len() as u32,
+                        });
                     }
                 }
                 if let Some(s) = self.streams.get_mut(&stream_id) {
                     s.receive_data(&data, end_stream);
+                    if end_stream {
+                        s.remote_closed = true;
+                    }
                 }
+                // The peer half-closing does NOT end the stream while we are still
+                // uploading — it becomes half-closed(remote) and our body pump must
+                // still be able to finish (RFC 7540 §5.1). Retire only when both
+                // directions are done.
                 if end_stream {
-                    self.streams.remove(&stream_id);
+                    self.retire_if_fully_closed(stream_id);
                 }
             }
-            Frame::RstStream { stream_id, error_code } => {
+            Frame::RstStream {
+                stream_id,
+                error_code,
+            } => {
                 if let Some(mut s) = self.streams.remove(&stream_id) {
                     s.receive_reset(error_code);
                 }
             }
-            Frame::WindowUpdate { stream_id, window_size_increment } => {
+            Frame::WindowUpdate {
+                stream_id,
+                window_size_increment,
+            } => {
                 if window_size_increment == 0 {
                     if stream_id == 0 {
                         return Err(H2Error::new(ErrorCode::ProtocolError, "zero WINDOW_UPDATE"));
@@ -354,19 +495,31 @@ impl ConnState {
             }
             Frame::Ping { ack, opaque_data } => {
                 if ack {
-                    if let Some(tx) = self.pings.remove(&opaque_data) {
-                        let _ = tx.send(());
+                    if let Some(w) = self.pings.remove(&opaque_data) {
+                        // Compute the RTT at ACK receipt (not when `ping` resumes).
+                        let _ = w.resolve.send(Ok(now_millis() - w.sent_at));
                     }
                 } else {
-                    self.send_frame(Frame::Ping { ack: true, opaque_data });
+                    self.send_frame(Frame::Ping {
+                        ack: true,
+                        opaque_data,
+                    });
                 }
             }
-            Frame::Goaway { last_stream_id, error_code, .. } => {
+            Frame::Goaway {
+                last_stream_id,
+                error_code,
+                ..
+            } => {
                 self.goaway_received = true;
                 let code = ErrorCode::from_value(error_code).unwrap_or(ErrorCode::NoError);
                 let err = H2Error::new(code, "peer sent GOAWAY");
-                let doomed: Vec<u32> =
-                    self.streams.keys().copied().filter(|&id| id > last_stream_id).collect();
+                let doomed: Vec<u32> = self
+                    .streams
+                    .keys()
+                    .copied()
+                    .filter(|&id| id > last_stream_id)
+                    .collect();
                 for id in doomed {
                     if let Some(mut s) = self.streams.remove(&id) {
                         s.fail(err.clone());
@@ -382,7 +535,10 @@ impl ConnState {
     }
 
     fn complete_header_block(&mut self) -> Result<(), H2Error> {
-        let pb = self.pending_header_block.take().expect("header block present");
+        let pb = self
+            .pending_header_block
+            .take()
+            .expect("header block present");
         let block: Vec<u8> = if pb.fragments.len() == 1 {
             pb.fragments.into_iter().next().unwrap()
         } else {
@@ -394,9 +550,12 @@ impl ConnState {
             HeaderBlockKind::Response => {
                 if let Some(s) = self.streams.get_mut(&pb.stream_id) {
                     s.receive_headers(headers, pb.end_stream);
+                    if pb.end_stream {
+                        s.remote_closed = true;
+                    }
                 }
                 if pb.end_stream {
-                    self.streams.remove(&pb.stream_id);
+                    self.retire_if_fully_closed(pb.stream_id);
                 }
             }
             HeaderBlockKind::Push => {
@@ -466,8 +625,25 @@ impl ConnState {
     }
 
     fn reset_stream(&mut self, id: u32, code: ErrorCode) {
-        self.send_frame(Frame::RstStream { stream_id: id, error_code: code.value() });
+        self.send_frame(Frame::RstStream {
+            stream_id: id,
+            error_code: code.value(),
+        });
         self.streams.remove(&id);
+    }
+
+    /// Drop a stream only once BOTH directions have ended. A one-sided close
+    /// (the peer's END_STREAM while we are still uploading, or our upload
+    /// finishing before the peer replies) leaves it half-closed and in the map,
+    /// so the still-open direction — and any WINDOW_UPDATEs for it — keep working.
+    fn retire_if_fully_closed(&mut self, id: u32) {
+        let fully_closed = self
+            .streams
+            .get(&id)
+            .is_some_and(|s| s.local_closed && s.remote_closed);
+        if fully_closed {
+            self.streams.remove(&id);
+        }
     }
 
     fn connection_error(&mut self, err: H2Error) {
@@ -492,7 +668,10 @@ impl ConnState {
                 s.fail(err.clone());
             }
         }
-        self.pings.clear();
+        // Fail every in-flight ping with the close error (mirrors the TS reject).
+        for (_, w) in self.pings.drain() {
+            let _ = w.resolve.send(Err(err.clone()));
+        }
     }
 }
 
@@ -511,20 +690,26 @@ impl H2Connection {
     /// The negotiated WebSocket subprotocol, if opened via a WebSocket (set by
     /// the caller). Empty otherwise.
     // (Kept minimal here; `connect_websocket` sets it in the web layer.)
-    pub async fn request(&self, init: RequestInit) -> Result<Response, H2Error> {
+    pub async fn request(&self, mut init: RequestInit) -> Result<Response, H2Error> {
+        let body = std::mem::take(&mut init.body);
+        let has_body = !body.is_empty();
+
         let id;
         let head_rx;
         let body_rx;
+        let task_tx;
         {
             let mut st = self.shared.borrow_mut();
             if st.closed {
-                return Err(st
-                    .close_error
-                    .clone()
-                    .unwrap_or_else(|| H2Error::new(ErrorCode::InternalError, "connection closed")));
+                return Err(st.close_error.clone().unwrap_or_else(|| {
+                    H2Error::new(ErrorCode::InternalError, "connection closed")
+                }));
             }
             if st.goaway_received {
-                return Err(H2Error::new(ErrorCode::RefusedStream, "connection is going away"));
+                return Err(H2Error::new(
+                    ErrorCode::RefusedStream,
+                    "connection is going away",
+                ));
             }
 
             id = st.next_stream_id;
@@ -536,19 +721,24 @@ impl H2Connection {
             let mut stream = StreamState::new(id, initial);
             stream.head_tx = Some(htx);
             stream.body_tx = Some(btx);
+            // A bodyless request half-closes immediately (HEADERS carries END_STREAM).
+            stream.local_closed = !has_body;
             st.streams.insert(id, stream);
             head_rx = hrx;
             body_rx = brx;
 
             let headers = build_request_headers(&init);
-            let has_body = !init.body.is_empty();
             let block = st.encoder.encode(&headers);
             st.send_headers(id, block, !has_body);
+            task_tx = st.task_tx.clone();
         }
 
-        // Flow-controlled body upload (in-memory). No-op for bodyless requests.
-        if !init.body.is_empty() {
-            self.pump_body(id, &init.body).await;
+        // Upload the body concurrently: the pump runs on the connection driver, so
+        // the response head (and even response body) can arrive while we are still
+        // sending — true bidirectional streaming. No-op for bodyless requests.
+        if has_body {
+            let pump = pump_body(self.shared.clone(), id, body);
+            let _ = task_tx.unbounded_send(pump.boxed_local());
         }
 
         match head_rx.await {
@@ -568,78 +758,38 @@ impl H2Connection {
         }
     }
 
-    async fn pump_body(&self, id: u32, body: &[u8]) {
-        let mut offset = 0;
-        while offset < body.len() {
-            // Await positive connection- and stream-level send windows.
-            let alive = poll_fn(|cx| {
-                let mut st = self.shared.borrow_mut();
-                if st.closed || !st.streams.contains_key(&id) {
-                    return Poll::Ready(false);
-                }
-                let conn_ready = st.conn_send_window.is_ready();
-                let stream_ready = st.streams.get(&id).map(|s| s.send_window.is_ready()).unwrap_or(false);
-                if conn_ready && stream_ready {
-                    Poll::Ready(true)
-                } else {
-                    if !conn_ready {
-                        st.conn_send_window.register_waker(cx.waker());
-                    }
-                    if !stream_ready {
-                        if let Some(s) = st.streams.get_mut(&id) {
-                            s.send_window.register_waker(cx.waker());
-                        }
-                    }
-                    Poll::Pending
-                }
-            })
-            .await;
-            if !alive {
-                return;
-            }
-
-            let mut st = self.shared.borrow_mut();
-            if st.closed || st.streams.get(&id).map(|s| s.send_window.is_closed()).unwrap_or(true) {
-                return;
-            }
-            let conn_w = st.conn_send_window.value();
-            let stream_w = st.streams.get(&id).unwrap().send_window.value();
-            let max = st.remote.max_frame_size as i64;
-            let remaining = (body.len() - offset) as i64;
-            let grant = remaining.min(conn_w).min(stream_w).min(max);
-            if grant <= 0 {
-                continue; // windows changed under us; re-await
-            }
-            st.conn_send_window.consume(grant);
-            st.streams.get_mut(&id).unwrap().send_window.consume(grant);
-            let slice = body[offset..offset + grant as usize].to_vec();
-            st.send_frame(Frame::Data { stream_id: id, data: slice, end_stream: false });
-            offset += grant as usize;
-        }
-        let st = self.shared.borrow();
-        st.send_frame(Frame::Data { stream_id: id, data: Vec::new(), end_stream: true });
-    }
-
-    /// Send a PING and resolve when the matching PONG arrives.
-    // TODO: return the round-trip time (needs a wasm-compatible clock).
-    pub async fn ping(&self) -> Result<(), H2Error> {
+    /// Send a PING and resolve with the round-trip time in milliseconds.
+    pub async fn ping(&self) -> Result<f64, H2Error> {
         let rx = {
             let mut st = self.shared.borrow_mut();
             if st.closed {
-                return Err(st
-                    .close_error
-                    .clone()
-                    .unwrap_or_else(|| H2Error::new(ErrorCode::InternalError, "connection closed")));
+                return Err(st.close_error.clone().unwrap_or_else(|| {
+                    H2Error::new(ErrorCode::InternalError, "connection closed")
+                }));
             }
             st.ping_counter = st.ping_counter.wrapping_add(1);
             let mut opaque = [0u8; 8];
             opaque[4..8].copy_from_slice(&st.ping_counter.to_be_bytes());
             let (tx, rx) = oneshot::channel();
-            st.pings.insert(opaque, tx);
-            st.send_frame(Frame::Ping { ack: false, opaque_data: opaque });
+            st.pings.insert(
+                opaque,
+                PingWaiter {
+                    resolve: tx,
+                    sent_at: now_millis(),
+                },
+            );
+            st.send_frame(Frame::Ping {
+                ack: false,
+                opaque_data: opaque,
+            });
             rx
         };
-        rx.await.map_err(|_| H2Error::new(ErrorCode::InternalError, "connection closed"))
+        // `Ok(res)` carries the ACK RTT or the teardown error; a bare `Canceled`
+        // (sender dropped without a value) collapses to a generic closed error.
+        match rx.await {
+            Ok(res) => res,
+            Err(_canceled) => Err(H2Error::new(ErrorCode::InternalError, "connection closed")),
+        }
     }
 
     /// Gracefully close: send GOAWAY, then tear down.
@@ -653,16 +803,147 @@ impl H2Connection {
             error_code: 0,
             debug_data: Vec::new(),
         });
-        st.destroy(H2Error::new(ErrorCode::NoError, "connection closed by client"));
+        st.destroy(H2Error::new(
+            ErrorCode::NoError,
+            "connection closed by client",
+        ));
     }
 }
 
+/// Upload a request body chunk-by-chunk, honoring connection- and stream-level
+/// flow control, then half-close the stream with an empty END_STREAM DATA frame.
+/// Runs on the connection driver (registered by `request`), so it does not block
+/// the caller — the response may stream back while this is still uploading.
+async fn pump_body(shared: Rc<RefCell<ConnState>>, id: u32, body: RequestBody) {
+    let mut chunks: LocalBoxStream<'static, Vec<u8>> = match body {
+        RequestBody::Empty => return,
+        RequestBody::Bytes(bytes) => stream::once(async move { bytes }).boxed_local(),
+        RequestBody::Stream(s) => s,
+    };
+    while let Some(chunk) = chunks.next().await {
+        if chunk.is_empty() {
+            continue;
+        }
+        if !pump_chunk(&shared, id, &chunk).await {
+            return; // stream reset / connection closed mid-upload; no END_STREAM
+        }
+    }
+    let mut st = shared.borrow_mut();
+    // The stream may have been reset/torn down while we uploaded the last chunk;
+    // only half-close a stream that is still live.
+    if st.streams.contains_key(&id) {
+        st.send_frame(Frame::Data {
+            stream_id: id,
+            data: Vec::new(),
+            end_stream: true,
+        });
+        if let Some(s) = st.streams.get_mut(&id) {
+            s.local_closed = true;
+        }
+        // If the peer already sent its END_STREAM, both sides are now done.
+        st.retire_if_fully_closed(id);
+    }
+}
+
+/// Send one body chunk as DATA frames, awaiting positive connection- and
+/// stream-level send windows between frames. Returns `false` if the stream or
+/// connection tore down mid-chunk (so the caller must not send END_STREAM).
+async fn pump_chunk(shared: &Rc<RefCell<ConnState>>, id: u32, chunk: &[u8]) -> bool {
+    let mut offset = 0;
+    while offset < chunk.len() {
+        // Await positive connection- and stream-level send windows.
+        let alive = poll_fn(|cx| {
+            let mut st = shared.borrow_mut();
+            if st.closed || !st.streams.contains_key(&id) {
+                return Poll::Ready(false);
+            }
+            let conn_ready = st.conn_send_window.is_ready();
+            let stream_ready = st
+                .streams
+                .get(&id)
+                .map(|s| s.send_window.is_ready())
+                .unwrap_or(false);
+            if conn_ready && stream_ready {
+                Poll::Ready(true)
+            } else {
+                if !conn_ready {
+                    st.conn_send_window.register_waker(cx.waker());
+                }
+                if !stream_ready {
+                    if let Some(s) = st.streams.get_mut(&id) {
+                        s.send_window.register_waker(cx.waker());
+                    }
+                }
+                Poll::Pending
+            }
+        })
+        .await;
+        if !alive {
+            return false;
+        }
+
+        let mut st = shared.borrow_mut();
+        if st.closed
+            || st
+                .streams
+                .get(&id)
+                .map(|s| s.send_window.is_closed())
+                .unwrap_or(true)
+        {
+            return false;
+        }
+        let conn_w = st.conn_send_window.value();
+        let stream_w = st.streams.get(&id).unwrap().send_window.value();
+        let max = st.remote.max_frame_size as i64;
+        let remaining = (chunk.len() - offset) as i64;
+        let grant = remaining.min(conn_w).min(stream_w).min(max);
+        if grant <= 0 {
+            continue; // windows changed under us; re-await
+        }
+        st.conn_send_window.consume(grant);
+        st.streams.get_mut(&id).unwrap().send_window.consume(grant);
+        let slice = chunk[offset..offset + grant as usize].to_vec();
+        st.send_frame(Frame::Data {
+            stream_id: id,
+            data: slice,
+            end_stream: false,
+        });
+        offset += grant as usize;
+    }
+    true
+}
+
+/// Current time in milliseconds, for PING round-trip timing. On `wasm32` this is
+/// the browser clock via `js_sys::Date::now()` — the Rust binding for JS
+/// `Date.now()` (what the TS client uses); it needs no `window`, so it also works
+/// in Web Workers. Off-wasm (host tests) it falls back to the system clock.
+#[cfg(target_arch = "wasm32")]
+fn now_millis() -> f64 {
+    js_sys::Date::now()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn now_millis() -> f64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .unwrap_or(0.0)
+}
+
 fn build_request_headers(init: &RequestInit) -> Vec<Header> {
-    let method = init.method.clone().unwrap_or_else(|| "GET".into()).to_uppercase();
+    let method = init
+        .method
+        .clone()
+        .unwrap_or_else(|| "GET".into())
+        .to_uppercase();
     let scheme = init.scheme.clone().unwrap_or_else(|| "http".into());
     let path = init.path.clone().unwrap_or_else(|| "/".into());
 
-    let mut headers = vec![Header::new(":method", method), Header::new(":scheme", scheme)];
+    let mut headers = vec![
+        Header::new(":method", method),
+        Header::new(":scheme", scheme),
+    ];
     if let Some(auth) = &init.authority {
         headers.push(Header::new(":authority", auth.clone()));
     }
@@ -688,8 +969,12 @@ fn build_request_headers(init: &RequestInit) -> Vec<Header> {
 /// write loops; the caller must spawn/poll it (on wasm, `spawn_local`). The
 /// preface + SETTINGS are queued immediately, so [`H2Connection::request`] may be
 /// called right away.
-pub fn connect(transport: Transport, options: ConnectOptions) -> (H2Connection, impl Future<Output = ()>) {
+pub fn connect(
+    transport: Transport,
+    options: ConnectOptions,
+) -> (H2Connection, impl Future<Output = ()>) {
     let (out_tx, out_rx) = mpsc::unbounded();
+    let (task_tx, task_rx) = mpsc::unbounded();
 
     let local_max_frame_size = options.max_frame_size.unwrap_or(DEFAULT_MAX_FRAME_SIZE);
     let local_initial_window = options.initial_window_size.unwrap_or(1024 * 1024);
@@ -698,6 +983,7 @@ pub fn connect(transport: Transport, options: ConnectOptions) -> (H2Connection, 
 
     let state = ConnState {
         out_tx,
+        task_tx,
         encoder: HpackEncoder::new(),
         decoder: HpackDecoder::new(header_table_size),
         frame_decoder: FrameDecoder::new(local_max_frame_size),
@@ -731,7 +1017,13 @@ pub fn connect(transport: Transport, options: ConnectOptions) -> (H2Connection, 
         });
     }
 
-    let driver = drive(shared.clone(), transport.reader, transport.writer, out_rx);
+    let driver = drive(
+        shared.clone(),
+        transport.reader,
+        transport.writer,
+        out_rx,
+        task_rx,
+    );
     (H2Connection { shared }, driver)
 }
 
@@ -740,6 +1032,7 @@ async fn drive(
     mut reader: crate::transport::ByteStream,
     mut writer: crate::transport::ByteSink,
     mut out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    task_rx: mpsc::UnboundedReceiver<LocalBoxFuture<'static, ()>>,
 ) {
     let read = {
         let shared = shared.clone();
@@ -752,145 +1045,44 @@ async fn drive(
                     break;
                 }
             }
-            shared.borrow_mut().destroy(H2Error::new(ErrorCode::NoError, "transport closed by peer"));
+            shared
+                .borrow_mut()
+                .destroy(H2Error::new(ErrorCode::NoError, "transport closed by peer"));
         }
     };
 
     let write = async move {
         while let Some(bytes) = out_rx.next().await {
             if writer.send(bytes).await.is_err() {
-                shared.borrow_mut().destroy(H2Error::new(ErrorCode::InternalError, "transport write failed"));
+                shared.borrow_mut().destroy(H2Error::new(
+                    ErrorCode::InternalError,
+                    "transport write failed",
+                ));
                 break;
             }
         }
     };
 
-    futures::pin_mut!(read, write);
-    futures::future::select(read, write).await;
+    // Body-upload pumps registered by `request` run here too, so uploads proceed
+    // concurrently with the read/write loops (and with one another).
+    let tasks = run_tasks(task_rx);
+
+    futures::pin_mut!(read, write, tasks);
+    futures::future::select(futures::future::select(read, write), tasks).await;
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use futures::executor::LocalPool;
-    use futures::task::LocalSpawnExt;
-
-    /// An in-memory transport; returns the client's outbound-read end and the
-    /// inbound-write end for the test to drive the "server" side.
-    fn mock_transport() -> (Transport, mpsc::UnboundedReceiver<Vec<u8>>, mpsc::UnboundedSender<Vec<u8>>) {
-        let (c2s_tx, c2s_rx) = mpsc::unbounded::<Vec<u8>>(); // client -> test
-        let (s2c_tx, s2c_rx) = mpsc::unbounded::<Vec<u8>>(); // test -> client
-        let writer = Box::pin(c2s_tx.sink_map_err(|e| crate::transport::TransportError(e.to_string())));
-        let reader = Box::pin(s2c_rx);
-        (Transport::new(reader, writer), c2s_rx, s2c_tx)
-    }
-
-    /// Read the client's opening bytes: the 24-byte preface, then `want` frames.
-    async fn read_startup(c2s_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>, want: usize) -> Vec<Frame> {
-        let mut buf: Vec<u8> = Vec::new();
-        while buf.len() < CONNECTION_PREFACE.len() {
-            buf.extend(c2s_rx.next().await.expect("client closed before preface"));
+/// Drive registered background tasks (body-upload pumps) to completion. Never
+/// resolves on its own; it is dropped when the read/write loop ends (teardown).
+async fn run_tasks(mut task_rx: mpsc::UnboundedReceiver<LocalBoxFuture<'static, ()>>) {
+    let mut pending: FuturesUnordered<LocalBoxFuture<'static, ()>> = FuturesUnordered::new();
+    poll_fn(move |cx| {
+        // Absorb any newly-registered pumps.
+        while let Poll::Ready(Some(task)) = task_rx.poll_next_unpin(cx) {
+            pending.push(task);
         }
-        assert_eq!(&buf[..CONNECTION_PREFACE.len()], CONNECTION_PREFACE);
-        let mut dec = FrameDecoder::default();
-        let mut frames = dec.push(&buf[CONNECTION_PREFACE.len()..]).unwrap();
-        while frames.len() < want {
-            let chunk = c2s_rx.next().await.expect("client closed before frames");
-            frames.extend(dec.push(&chunk).unwrap());
-        }
-        frames
-    }
-
-    #[test]
-    fn opens_with_preface_and_settings_not_http1_upgrade() {
-        let mut pool = LocalPool::new();
-        let (transport, mut c2s_rx, _s2c_tx) = mock_transport();
-        let (_conn, driver) = connect(transport, ConnectOptions::default());
-        pool.spawner().spawn_local(driver).unwrap();
-
-        pool.run_until(async move {
-            let frames = read_startup(&mut c2s_rx, 1).await;
-            assert!(matches!(frames[0], Frame::Settings { ack: false, .. }));
-        });
-    }
-
-    #[test]
-    fn sends_first_request_before_any_server_bytes() {
-        let mut pool = LocalPool::new();
-        let sp = pool.spawner();
-        let (transport, mut c2s_rx, _s2c_tx) = mock_transport();
-        let (conn, driver) = connect(transport, ConnectOptions::default());
-        sp.spawn_local(driver).unwrap();
-
-        // Fire a request; never feed the client any server bytes. If it gated on
-        // the server's preface, the HEADERS would never be written.
-        let conn2 = conn.clone();
-        sp.spawn_local(async move {
-            let _ = conn2
-                .request(RequestInit {
-                    method: Some("GET".into()),
-                    path: Some("/hello".into()),
-                    authority: Some("example.com".into()),
-                    ..Default::default()
-                })
-                .await;
-        })
-        .unwrap();
-
-        pool.run_until(async move {
-            let frames = read_startup(&mut c2s_rx, 2).await;
-            assert!(matches!(frames[0], Frame::Settings { ack: false, .. }));
-            assert!(matches!(frames[1], Frame::Headers { stream_id: 1, .. }));
-        });
-    }
-
-    #[test]
-    fn completes_a_request_when_the_server_replies_afterwards() {
-        let mut pool = LocalPool::new();
-        let sp = pool.spawner();
-        let (transport, mut c2s_rx, s2c_tx) = mock_transport();
-        let (conn, driver) = connect(transport, ConnectOptions::default());
-        sp.spawn_local(driver).unwrap();
-
-        pool.run_until(async move {
-            let req = conn.request(RequestInit {
-                method: Some("GET".into()),
-                path: Some("/hello".into()),
-                authority: Some("example.com".into()),
-                ..Default::default()
-            });
-
-            let server = async move {
-                // Wait until the client has written its request HEADERS (stream 1).
-                let frames = read_startup(&mut c2s_rx, 2).await;
-                assert!(matches!(frames[1], Frame::Headers { stream_id: 1, .. }));
-                // Reply after the request was already sent (prior-knowledge ordering).
-                s2c_tx
-                    .unbounded_send(serialize_frame(&Frame::Settings { ack: false, settings: Settings::default() }))
-                    .unwrap();
-                let block = HpackEncoder::new().encode(&[Header::new(":status", "200")]);
-                s2c_tx
-                    .unbounded_send(serialize_frame(&Frame::Headers {
-                        stream_id: 1,
-                        header_block_fragment: block,
-                        end_stream: false,
-                        end_headers: true,
-                        priority: None,
-                    }))
-                    .unwrap();
-                s2c_tx
-                    .unbounded_send(serialize_frame(&Frame::Data {
-                        stream_id: 1,
-                        data: b"ok".to_vec(),
-                        end_stream: true,
-                    }))
-                    .unwrap();
-            };
-
-            let (res, ()) = futures::join!(req, server);
-            let res = res.unwrap();
-            assert_eq!(res.status, 200);
-            assert_eq!(res.text().await, "ok");
-        });
-    }
+        // Advance in-flight pumps; drop completions (empties fall through to Pending).
+        while let Poll::Ready(Some(())) = pending.poll_next_unpin(cx) {}
+        Poll::Pending
+    })
+    .await
 }

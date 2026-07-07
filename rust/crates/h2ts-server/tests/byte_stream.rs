@@ -5,8 +5,8 @@ mod common;
 use common::client_ws_stream;
 
 use fastwebsockets::{Frame, OpCode, Payload, Role, WebSocket};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use h2ts_server::{BridgeConfig, CloseFrame, WsByteStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
 async fn byte_stream_reads_and_writes() {
@@ -109,8 +109,16 @@ async fn byte_stream_full_duplex() {
 
     w1.await.unwrap();
     w2.await.unwrap();
-    assert_eq!(r1.await.unwrap(), up_expected, "server->client stream intact");
-    assert_eq!(r2.await.unwrap(), down_expected, "client->server stream intact");
+    assert_eq!(
+        r1.await.unwrap(),
+        up_expected,
+        "server->client stream intact"
+    );
+    assert_eq!(
+        r2.await.unwrap(),
+        down_expected,
+        "client->server stream intact"
+    );
 }
 
 /// The reader sees a continuous byte stream: WS frame boundaries are invisible,

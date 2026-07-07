@@ -19,6 +19,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use bytes::Bytes;
+use h2ts_server::{accept_with_options, bridge_with, AcceptOptions, BridgeConfig, KeepAlive};
 use http_body_util::Empty;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -26,7 +27,6 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::net::{TcpListener, TcpStream};
-use h2ts_server::{accept_with_options, bridge_with, AcceptOptions, BridgeConfig, KeepAlive};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -55,7 +55,11 @@ async fn main() -> Result<(), BoxError> {
         Some(k) => format!("keepalive {}s", k.interval.as_secs()),
         None => "keepalive off".to_string(),
     };
-    let codec = if allow_implicit_codec { "any subprotocol" } else { "h2ts only" };
+    let codec = if allow_implicit_codec {
+        "any subprotocol"
+    } else {
+        "h2ts only"
+    };
     eprintln!("[h2ts-proxy] listening ws://{listen}  ->  tcp://{upstream} (h2c, {ka}, {codec})");
 
     loop {
@@ -65,7 +69,13 @@ async fn main() -> Result<(), BoxError> {
         tokio::spawn(async move {
             let io = TokioIo::new(socket);
             let service = service_fn(move |req| {
-                handle(req, upstream.clone(), peer, keepalive.clone(), allow_implicit_codec)
+                handle(
+                    req,
+                    upstream.clone(),
+                    peer,
+                    keepalive.clone(),
+                    allow_implicit_codec,
+                )
             });
             if let Err(err) = http1::Builder::new()
                 .serve_connection(io, service)

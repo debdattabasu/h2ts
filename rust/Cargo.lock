@@ -347,6 +347,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "h2ts-conformance"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "fastwebsockets",
+ "futures",
+ "h2ts-client",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "tokio",
+]
+
+[[package]]
 name = "h2ts-server"
 version = "0.1.0"
 dependencies = [

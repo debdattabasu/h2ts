@@ -1,0 +1,31 @@
+[package]
+name = "h2ts-conformance"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Cross-stack conformance driver for the Rust h2ts-client (native WebSocket). Not published."
+
+# A native driver that runs the shared conformance battery (conformance/run.mjs)
+# through the *Rust* client, so `h2ts-client` is exercised end-to-end against a
+# real gateway — not only its hand-rolled mock-server unit tests. Kept in its own
+# crate so tokio/fastwebsockets never leak into the tokio-free client library.
+[[bin]]
+name = "h2ts-conformance"
+path = "src/main.rs"
+
+[dependencies]
+# The engine under test. `default-features = false` drops the browser `web`
+# feature (wasm-only) — this driver brings its own native transport.
+h2ts-client = { path = "../h2ts-client", default-features = false }
+# Runtime-agnostic Stream/Sink + channels: the glue between the (Send) WebSocket
+# tasks and the client's (!Send) transport, matching the client's own test style.
+futures = { version = "0.3", features = ["std", "async-await"] }
+tokio = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+# The native WebSocket *client* (masks its frames), same dep the server tests use.
+fastwebsockets = { workspace = true }

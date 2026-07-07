@@ -119,7 +119,10 @@ fn header_lists<B>(request: &Request<B>, header: HeaderName, needle: &str) -> bo
         .headers()
         .get(header)
         .and_then(|v| v.to_str().ok())
-        .map(|list| list.split(',').any(|t| t.trim().eq_ignore_ascii_case(needle)))
+        .map(|list| {
+            list.split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case(needle))
+        })
         .unwrap_or(false)
 }
 
@@ -246,8 +249,7 @@ where
     };
 
     // base64 output is always valid header-value ASCII, so this never fails.
-    let accept_header =
-        HeaderValue::from_str(&accept_value).expect("base64 is valid header ASCII");
+    let accept_header = HeaderValue::from_str(&accept_value).expect("base64 is valid header ASCII");
     let mut response = Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)
         .header(CONNECTION, HeaderValue::from_static("Upgrade"))
@@ -258,9 +260,7 @@ where
     if let Some(proto) = chosen {
         // Skip a subprotocol that isn't a valid header value rather than fail.
         if let Ok(value) = HeaderValue::from_str(&proto) {
-            response
-                .headers_mut()
-                .insert(SEC_WEBSOCKET_PROTOCOL, value);
+            response.headers_mut().insert(SEC_WEBSOCKET_PROTOCOL, value);
         }
     }
 
@@ -333,176 +333,4 @@ pub fn accept<B>(
     WebSocketError,
 > {
     accept_with(request, |_offered| None)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        accept, accept_with, accept_with_options, fallback_subprotocol, is_upgrade_request,
-        offered_protocols, AcceptOptions, WebSocketError,
-    };
-    use http::header::{CONNECTION, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_PROTOCOL, UPGRADE};
-    use hyper::{Request, StatusCode};
-
-    fn with_protocol(protocol: Option<&str>) -> Request<()> {
-        let mut b = Request::builder();
-        if let Some(p) = protocol {
-            b = b.header(SEC_WEBSOCKET_PROTOCOL, p);
-        }
-        b.body(()).unwrap()
-    }
-
-    /// A well-formed WebSocket upgrade request offering `offer` (if any).
-    fn upgrade_request(offer: Option<&str>) -> Request<()> {
-        let mut b = Request::builder()
-            .header(UPGRADE, "websocket")
-            .header(CONNECTION, "Upgrade")
-            .header(SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==");
-        if let Some(o) = offer {
-            b = b.header(SEC_WEBSOCKET_PROTOCOL, o);
-        }
-        b.body(()).unwrap()
-    }
-
-    #[test]
-    fn offered_protocols_parses_the_list_in_order() {
-        assert_eq!(offered_protocols(&with_protocol(Some("h2ts"))), ["h2ts"]);
-        assert_eq!(
-            offered_protocols(&with_protocol(Some("chat, h2ts, binary"))),
-            ["chat", "h2ts", "binary"]
-        );
-        assert_eq!(offered_protocols(&with_protocol(Some("  h2ts  "))), ["h2ts"]);
-        assert!(offered_protocols(&with_protocol(Some(""))).is_empty());
-        assert!(offered_protocols(&with_protocol(None)).is_empty());
-    }
-
-    #[test]
-    fn is_upgrade_request_requires_all_three_signals() {
-        let full = Request::builder()
-            .header(UPGRADE, "websocket")
-            .header(CONNECTION, "Upgrade")
-            .header(SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==")
-            .body(())
-            .unwrap();
-        assert!(is_upgrade_request(&full));
-
-        // Connection may be a token list ("keep-alive, Upgrade").
-        let listed = Request::builder()
-            .header(UPGRADE, "websocket")
-            .header(CONNECTION, "keep-alive, Upgrade")
-            .header(SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==")
-            .body(())
-            .unwrap();
-        assert!(is_upgrade_request(&listed));
-
-        // Missing the key.
-        let no_key = Request::builder()
-            .header(UPGRADE, "websocket")
-            .header(CONNECTION, "Upgrade")
-            .body(())
-            .unwrap();
-        assert!(!is_upgrade_request(&no_key));
-
-        // A plain request.
-        assert!(!is_upgrade_request(&Request::builder().body(()).unwrap()));
-    }
-
-    #[test]
-    fn fallback_prefers_h2ts_then_optionally_the_first_offered() {
-        use super::Fallback::{Accept, Reject};
-
-        // h2ts always wins when offered, in its exact casing, regardless of the flag.
-        assert_eq!(fallback_subprotocol(&["h2ts"], false), Accept(Some("h2ts".into())));
-        assert_eq!(
-            fallback_subprotocol(&["chat", "h2ts"], false),
-            Accept(Some("h2ts".into())),
-            "h2ts is preferred even when it isn't first"
-        );
-        assert_eq!(
-            fallback_subprotocol(&["H2TS"], false),
-            Accept(Some("H2TS".into())),
-            "matched case-insensitively but echoed in the offered casing"
-        );
-
-        // No h2ts, flag off: reject (an empty offer is also rejected).
-        assert_eq!(fallback_subprotocol(&["chat"], false), Reject);
-        assert_eq!(fallback_subprotocol(&["chat", "binary"], false), Reject);
-        assert_eq!(fallback_subprotocol(&[], false), Reject);
-
-        // No h2ts, flag on: implicitly accept the first offered codec...
-        assert_eq!(
-            fallback_subprotocol(&["chat", "binary"], true),
-            Accept(Some("chat".into()))
-        );
-        // ...and an empty offer completes with no subprotocol.
-        assert_eq!(fallback_subprotocol(&[], true), Accept(None));
-    }
-
-    #[test]
-    fn accept_echoes_h2ts_when_offered() {
-        let mut req = upgrade_request(Some("h2ts"));
-        let (resp, _fut) = accept(&mut req).unwrap();
-        assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
-        assert_eq!(resp.headers().get(SEC_WEBSOCKET_PROTOCOL).unwrap(), "h2ts");
-
-        // Preferred even when offered alongside others.
-        let mut req = upgrade_request(Some("chat, h2ts"));
-        let (resp, _fut) = accept(&mut req).unwrap();
-        assert_eq!(resp.headers().get(SEC_WEBSOCKET_PROTOCOL).unwrap(), "h2ts");
-    }
-
-    #[test]
-    fn accept_rejects_when_h2ts_absent_by_default() {
-        // A non-h2ts offer and an empty offer both reject with a 400 response,
-        // rather than completing the handshake.
-        for offer in [Some("mystery"), Some("chat, binary"), None] {
-            let mut req = upgrade_request(offer);
-            let err = accept(&mut req).err().expect("should reject");
-            assert!(
-                matches!(&err, WebSocketError::UnsupportedSubprotocol),
-                "offer {offer:?}"
-            );
-            assert_eq!(err.rejection_response().status(), StatusCode::BAD_REQUEST);
-        }
-    }
-
-    #[test]
-    fn accept_with_honors_a_selection_even_without_h2ts() {
-        // The handler selecting an offered codec accepts it — no reject, no h2ts.
-        let mut req = upgrade_request(Some("chat, binary"));
-        let (resp, _fut) = accept_with(&mut req, |offered| {
-            offered.iter().find(|p| **p == "binary").map(|p| p.to_string())
-        })
-        .unwrap();
-        assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
-        assert_eq!(resp.headers().get(SEC_WEBSOCKET_PROTOCOL).unwrap(), "binary");
-    }
-
-    #[test]
-    fn allow_implicit_codec_accepts_the_first_offered_codec() {
-        let opts = AcceptOptions {
-            allow_implicit_codec: true,
-        };
-        // Unknown codec: accepted, first offered echoed.
-        let mut req = upgrade_request(Some("mystery, other"));
-        let (resp, _fut) = accept_with_options(&mut req, |_| None, opts).unwrap();
-        assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
-        assert_eq!(resp.headers().get(SEC_WEBSOCKET_PROTOCOL).unwrap(), "mystery");
-
-        // No offer: still accepted (permissive), nothing echoed.
-        let mut req = upgrade_request(None);
-        let (resp, _fut) = accept_with_options(&mut req, |_| None, opts).unwrap();
-        assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
-        assert!(resp.headers().get(SEC_WEBSOCKET_PROTOCOL).is_none());
-    }
-
-    #[test]
-    fn accept_key_matches_rfc_6455_example() {
-        // RFC 6455 §1.3: key "dGhlIHNhbXBsZSBub25jZQ==" -> accept
-        // "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=".
-        assert_eq!(
-            super::accept_key(b"dGhlIHNhbXBsZSBub25jZQ=="),
-            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
-        );
-    }
 }

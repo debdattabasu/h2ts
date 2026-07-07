@@ -71,7 +71,10 @@ export class H2Connection {
 
   private pendingHeaderBlock: PendingHeaderBlock | undefined;
   private writeQueue: Promise<void> = Promise.resolve();
-  private readonly pings = new Map<string, { resolve: (rtt: number) => void; sentAt: number }>();
+  private readonly pings = new Map<
+    string,
+    { resolve: (rtt: number) => void; reject: (err: unknown) => void; sentAt: number }
+  >();
   private pingCounter = 0;
 
   private closedFlag = false;
@@ -390,7 +393,7 @@ export class H2Connection {
         reject(this.closeError ?? new H2Error("INTERNAL_ERROR", "connection closed"));
         return;
       }
-      this.pings.set(key, { resolve, sentAt: Date.now() });
+      this.pings.set(key, { resolve, reject, sentAt: Date.now() });
       void this.send({ type: FrameType.PING, streamId: 0, ack: false, opaqueData: opaque });
     });
   }
@@ -518,7 +521,10 @@ export class H2Connection {
     this.connSendWindow.close();
     for (const stream of this.streams.values()) stream.fail(err);
     this.streams.clear();
-    for (const { resolve } of this.pings.values()) resolve(-1);
+    // Fail every in-flight ping with the close error, matching the "already
+    // closed" path (and the Rust client) — never resolve a bogus RTT.
+    const pingError = this.closeError ?? new H2Error("NO_ERROR", "connection closed");
+    for (const { reject } of this.pings.values()) reject(pingError);
     this.pings.clear();
     // Best-effort transport close.
     this.writer.close().catch(() => {

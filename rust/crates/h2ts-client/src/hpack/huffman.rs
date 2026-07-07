@@ -9,7 +9,10 @@ use crate::errors::{ErrorCode, H2Error};
 
 /// Number of bits the Huffman encoding of `input` would occupy.
 fn encoded_bit_length(input: &[u8]) -> usize {
-    input.iter().map(|&b| HUFFMAN_CODES[b as usize].1 as usize).sum()
+    input
+        .iter()
+        .map(|&b| HUFFMAN_CODES[b as usize].1 as usize)
+        .sum()
 }
 
 /// Huffman-encode bytes, padding the final byte with the EOS prefix (all 1s).
@@ -83,12 +86,20 @@ pub fn huffman_decode(input: &[u8]) -> Result<Vec<u8>, H2Error> {
             }
             node = match node.children[b].as_deref() {
                 Some(n) => n,
-                None => return Err(H2Error::new(ErrorCode::CompressionError, "invalid Huffman code")),
+                None => {
+                    return Err(H2Error::new(
+                        ErrorCode::CompressionError,
+                        "invalid Huffman code",
+                    ))
+                }
             };
             partial_bits += 1;
             if let Some(sym) = node.symbol {
                 if sym == HUFFMAN_EOS {
-                    return Err(H2Error::new(ErrorCode::CompressionError, "EOS symbol in Huffman stream"));
+                    return Err(H2Error::new(
+                        ErrorCode::CompressionError,
+                        "EOS symbol in Huffman stream",
+                    ));
                 }
                 out.push(sym as u8);
                 node = root;
@@ -100,7 +111,10 @@ pub fn huffman_decode(input: &[u8]) -> Result<Vec<u8>, H2Error> {
 
     // Any leftover must be <=7 bits of all-1s (a prefix of the EOS code). §5.2.
     if !core::ptr::eq(node, root) && (partial_bits > 7 || !partial_all_ones) {
-        return Err(H2Error::new(ErrorCode::CompressionError, "invalid Huffman padding"));
+        return Err(H2Error::new(
+            ErrorCode::CompressionError,
+            "invalid Huffman padding",
+        ));
     }
     Ok(out)
 }

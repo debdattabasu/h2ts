@@ -66,7 +66,9 @@ async fn open(url: &str, protocols: &[&str]) -> Result<WebSocket, JsValue> {
     ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
     ws.set_onerror(Some(onerror.as_ref().unchecked_ref()));
 
-    let result = rx.await.map_err(|_| JsValue::from_str("WebSocket open canceled"))?;
+    let result = rx
+        .await
+        .map_err(|_| JsValue::from_str("WebSocket open canceled"))?;
 
     ws.set_onopen(None);
     ws.set_onerror(None);

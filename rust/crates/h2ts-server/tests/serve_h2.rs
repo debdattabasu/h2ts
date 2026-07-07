@@ -5,6 +5,7 @@ mod common;
 use common::{app, connect_h2, get, handshake_status, start_server};
 
 use bytes::Bytes;
+use h2ts_server::{serve_h2, AcceptOptions, WebSocketError};
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -12,7 +13,6 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
-use h2ts_server::{serve_h2, AcceptOptions, WebSocketError};
 
 #[tokio::test]
 async fn h2_over_ws_full_roundtrip() {
@@ -79,9 +79,7 @@ async fn h2_over_ws_concurrent_streams() {
 async fn accept_with_selects_from_offered_subprotocols() {
     // Handler echoes "chat" if offered; otherwise declines (which makes accept_with
     // fall back to h2ts when offered).
-    async fn handler(
-        mut req: Request<Incoming>,
-    ) -> Result<Response<Empty<Bytes>>, WebSocketError> {
+    async fn handler(mut req: Request<Incoming>) -> Result<Response<Empty<Bytes>>, WebSocketError> {
         let (response, ws_fut) = h2ts_server::accept_with(&mut req, |offered| {
             offered
                 .iter()
@@ -152,9 +150,7 @@ async fn strict_server_rejects_non_h2ts_over_the_wire() {
 /// `h2ts` still wins when offered, and an empty offer completes with none.
 #[tokio::test]
 async fn allow_implicit_codec_accepts_any_offered_codec() {
-    async fn handler(
-        mut req: Request<Incoming>,
-    ) -> Result<Response<Empty<Bytes>>, WebSocketError> {
+    async fn handler(mut req: Request<Incoming>) -> Result<Response<Empty<Bytes>>, WebSocketError> {
         let (response, ws_fut) = match h2ts_server::accept_with_options(
             &mut req,
             |_offered| None,
@@ -191,7 +187,14 @@ async fn allow_implicit_codec_accepts_any_offered_codec() {
     // Unknown codec: accepted, its first offered codec echoed, tunnel works.
     let (mut sender, negotiated) = connect_h2(addr, &["mystery-codec", "other"]).await;
     assert_eq!(negotiated.as_deref(), Some("mystery-codec"));
-    assert_eq!(sender.send_request(get(addr, "/hello")).await.unwrap().status(), 200);
+    assert_eq!(
+        sender
+            .send_request(get(addr, "/hello"))
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
 
     // h2ts still wins when offered.
     let (_sender, negotiated) = connect_h2(addr, &["chat", "h2ts"]).await;

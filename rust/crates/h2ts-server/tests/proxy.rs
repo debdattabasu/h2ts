@@ -158,7 +158,11 @@ async fn proxy_allow_implicit_codec_accepts_any_subprotocol() {
     let (mut sender, negotiated) = connect_h2(listen, &["binary"]).await;
     assert_eq!(negotiated.as_deref(), Some("binary"));
     assert_eq!(
-        sender.send_request(get(listen, "/hello")).await.unwrap().status(),
+        sender
+            .send_request(get(listen, "/hello"))
+            .await
+            .unwrap()
+            .status(),
         200
     );
 

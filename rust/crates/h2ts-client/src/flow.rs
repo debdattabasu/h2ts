@@ -18,7 +18,11 @@ pub struct SendWindow {
 
 impl SendWindow {
     pub fn new(initial: i64) -> Self {
-        Self { available: initial, wakers: Vec::new(), closed: false }
+        Self {
+            available: initial,
+            wakers: Vec::new(),
+            closed: false,
+        }
     }
 
     pub fn value(&self) -> i64 {

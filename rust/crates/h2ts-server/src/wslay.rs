@@ -502,7 +502,9 @@ where
                             let ctx = ctx_addr as wslay_event_context_ptr;
                             queue_close(ctx, close.code, close.reason.as_bytes());
                             wslay_event_send(ctx);
-                            std::mem::take(&mut (*(sp_addr as *const RefCell<Shared>)).borrow_mut().outbound)
+                            std::mem::take(
+                                &mut (*(sp_addr as *const RefCell<Shared>)).borrow_mut().outbound,
+                            )
                         };
                         if !outbound.is_empty() {
                             let _ = ws_write.lock().await.write_all(&outbound).await;
@@ -515,7 +517,9 @@ where
                     let ctx = ctx_addr as wslay_event_context_ptr;
                     queue_msg(ctx, wslay_opcode_WSLAY_BINARY_FRAME as u8, &buf[..n]);
                     wslay_event_send(ctx);
-                    std::mem::take(&mut (*(sp_addr as *const RefCell<Shared>)).borrow_mut().outbound)
+                    std::mem::take(
+                        &mut (*(sp_addr as *const RefCell<Shared>)).borrow_mut().outbound,
+                    )
                 };
                 if !outbound.is_empty() {
                     ws_write.lock().await.write_all(&outbound).await?;
@@ -543,7 +547,9 @@ where
                         ControlCmd::Close(cf) => queue_close(ctx, cf.code, cf.reason.as_bytes()),
                     }
                     wslay_event_send(ctx);
-                    std::mem::take(&mut (*(sp_addr as *const RefCell<Shared>)).borrow_mut().outbound)
+                    std::mem::take(
+                        &mut (*(sp_addr as *const RefCell<Shared>)).borrow_mut().outbound,
+                    )
                 };
                 if !outbound.is_empty() {
                     ws_write.lock().await.write_all(&outbound).await?;
@@ -575,7 +581,9 @@ where
                     let ctx = ctx_addr as wslay_event_context_ptr;
                     queue_msg(ctx, wslay_opcode_WSLAY_PING as u8, b"");
                     wslay_event_send(ctx);
-                    std::mem::take(&mut (*(sp_addr as *const RefCell<Shared>)).borrow_mut().outbound)
+                    std::mem::take(
+                        &mut (*(sp_addr as *const RefCell<Shared>)).borrow_mut().outbound,
+                    )
                 };
                 if !outbound.is_empty() {
                     ws_write.lock().await.write_all(&outbound).await?;
@@ -588,7 +596,9 @@ where
                         let ctx = ctx_addr as wslay_event_context_ptr;
                         queue_close(ctx, ka.close.code, ka.close.reason.as_bytes());
                         wslay_event_send(ctx);
-                        std::mem::take(&mut (*(sp_addr as *const RefCell<Shared>)).borrow_mut().outbound)
+                        std::mem::take(
+                            &mut (*(sp_addr as *const RefCell<Shared>)).borrow_mut().outbound,
+                        )
                     };
                     if !outbound.is_empty() {
                         let _ = ws_write.lock().await.write_all(&outbound).await;

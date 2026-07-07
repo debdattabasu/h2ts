@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 
 use anyhow::Result;
 use bytes::Bytes;
+use h2ts_server::{accept, serve_h2};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -20,7 +21,6 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
-use h2ts_server::{accept, serve_h2};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -130,7 +130,12 @@ async fn route(req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_string();
-            build(200, "text/plain", &[("x-saw-custom", seen)], Bytes::from("ok"))
+            build(
+                200,
+                "text/plain",
+                &[("x-saw-custom", seen)],
+                Bytes::from("ok"),
+            )
         }
 
         _ => Ok(Response::builder()
@@ -140,7 +145,12 @@ async fn route(req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
 }
 
 fn text(body: &str) -> Result<Response<Full<Bytes>>> {
-    build(200, "text/plain; charset=utf-8", &[], Bytes::from(body.to_string()))
+    build(
+        200,
+        "text/plain; charset=utf-8",
+        &[],
+        Bytes::from(body.to_string()),
+    )
 }
 
 fn build(
@@ -149,7 +159,9 @@ fn build(
     extra: &[(&str, String)],
     body: Bytes,
 ) -> Result<Response<Full<Bytes>>> {
-    let mut b = Response::builder().status(status).header("content-type", content_type);
+    let mut b = Response::builder()
+        .status(status)
+        .header("content-type", content_type);
     for (name, value) in extra {
         b = b.header(*name, value);
     }

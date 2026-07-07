@@ -5,8 +5,8 @@
 //! The receive-path tests push large / fragmented / control frames at wslay,
 //! which is the one place it must never buffer a whole frame.
 use fastwebsockets::{Frame, OpCode, Payload, Role, WebSocket};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use h2ts_server::bridge;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
 async fn bridge_forwards_bytes_both_directions() {
@@ -88,7 +88,10 @@ async fn bridge_reassembles_a_large_inbound_frame() {
 
     let mut got = vec![0u8; expected.len()];
     peer_test.read_exact(&mut got).await.unwrap();
-    assert_eq!(got, expected, "every byte of the large frame must reach the peer, in order");
+    assert_eq!(
+        got, expected,
+        "every byte of the large frame must reach the peer, in order"
+    );
 }
 
 /// Several complete frames can land in a single read. wslay must decode all of
@@ -159,7 +162,10 @@ async fn bridge_propagates_client_close_to_peer() {
     });
 
     let mut client_ws = WebSocket::after_handshake(client_io, Role::Client);
-    client_ws.write_frame(Frame::close(1000, b"")).await.unwrap();
+    client_ws
+        .write_frame(Frame::close(1000, b""))
+        .await
+        .unwrap();
 
     let mut buf = [0u8; 16];
     let n = peer_test.read(&mut buf).await.unwrap();
