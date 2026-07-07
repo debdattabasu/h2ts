@@ -124,21 +124,32 @@ those paths — but **only for TS**.
    accessor** for the negotiated subprotocol — the spec says clients *SHOULD* expose it
    (`spec/protocol.md:35`); TS does, Rust doesn't.
 
-### Rust server (39 tests — strong, catalogued gaps)
+### Rust server (46 tests — strong; the P3 gaps below are now closed)
 
 Well covered: handshake negotiation/rejection, `allow_implicit_codec`, bridge
 full-duplex, sub-frame streaming, large payloads, 16 concurrent streams, keepalive
-(both outcomes), proxy binary, `serve_h2`. Notable gaps:
-- **`serve_h2_with` has zero coverage** (`lib.rs:147`) — the only path composing live
-  h2 with keepalive/hooks.
-- **Abnormal closure (1006)** — transport EOF with no Close frame, the common
-  network-drop case, is untested.
-- **Bridge error/teardown** (write failure → `Err` + `on_close(1006)`) untested.
-- **Handshake 426 (`NotUpgradeRequest`) and 500 (`Upgrade`) arms** untested — only the
-  400 arm is asserted.
-- GOAWAY/graceful h2 shutdown, custom `KeepAlive.close`, `WsControl` after bridge end
-  (`BrokenPipe`), and true backpressure (currently only byte-exactness is asserted) —
-  all untested.
+(both outcomes), proxy binary, `serve_h2`. The lifecycle-edge gaps below were closed
+in **P3 (A+B+C)**:
+- ~~**`serve_h2_with` has zero coverage**~~ **(done)** — `tests/serve_h2_with.rs`
+  drives real h2 traffic (100 KiB `/big` + 32 KiB `/echo`) while a 5ms keepalive pings
+  in the background, asserting byte-exactness (a ping can't corrupt the h2 stream) and
+  that `on_close` fires on teardown.
+- ~~**Abnormal closure (1006)**~~ **(done)** — `bridge_reports_1006_on_transport_drop_without_close`:
+  a WS transport EOF with no Close frame surfaces to `on_close` as 1006, empty reason.
+- ~~**Bridge error/teardown**~~ **(done)** — `bridge_reports_1006_with_reason_on_peer_write_failure`
+  uses a `FailingPeer` (writes always `Err`, reads park) to deterministically hit the
+  write-failure path → `on_close(1006, <io error text>)`.
+- ~~**Handshake 426 (`NotUpgradeRequest`) arm**~~ **(done)** —
+  `accept_rejects_a_non_upgrade_request_with_426` + `rejection_response_maps_constructible_errors_to_status`.
+  The **500 (`Upgrade`) arm** wraps a `hyper::Error` with no public constructor, so it's
+  only reachable through a live post-101 upgrade failure — left uncovered (documented in
+  the test).
+- ~~custom `KeepAlive.close`~~ **(done)** — `keepalive_uses_a_custom_close_frame`.
+  ~~`WsControl` after bridge end (`BrokenPipe`)~~ **(done)** —
+  `wscontrol_send_fails_after_the_bridge_ends`.
+- **Still open (deferred, item 11/12):** the client's wasm `web.rs` WS transport
+  (needs a `wasm-bindgen-test` harness), GOAWAY/graceful h2 shutdown under active
+  traffic, and a true backpressure assertion (only byte-exactness is asserted today).
 
 ---
 
@@ -277,4 +288,18 @@ does the right thing"* — using the same mock-server harness as the P1.1 test.
     lifetime (flushes the queue, then ends); TS `destroy` chains `close()` after
     `writeQueue`. Now both send the GOAWAY, asserted in both.
   - _Verified:_ Rust client 45 tests, TS 41, conformance 16/16 both clients.
-- [ ] P3 Server + WS-transport gaps
+- [x] **P3 (A+B+C)** Server lifecycle-edge coverage — _done 2026-07-07._ Seven new
+  server tests, all pure-Rust (no new deps), closing the compose/failure-path gaps —
+  the same "edge nobody drives" class that hid the P1.1 client bug. **A (failure
+  lifecycle):** `serve_h2_with` compose (h2 + 5ms keepalive + `on_close`, asserting a
+  ping can't corrupt h2 DATA — `tests/serve_h2_with.rs`); abnormal-close 1006 on a
+  transport drop with no Close frame; write-failure teardown → `on_close(1006, <error>)`
+  via a `FailingPeer` that forces the write-error branch deterministically (a plain
+  duplex races read-EOF vs write-error). **B (handshake):** the 426 `NotUpgradeRequest`
+  arm + the `rejection_response` status map (the 500 `Upgrade` arm isn't unit-
+  constructible — `hyper::Error` has no public ctor — so it's noted, not tested).
+  **C (control edges):** custom `KeepAlive.close` code/reason; `WsControl` send →
+  `BrokenPipe` after the bridge ends. Suite: **h2ts-server 46 tests** (was 39), clippy
+  clean, rustfmt clean. **Deferred (separate lift):** the client wasm `web.rs` WS
+  transport (item 11 — needs a `wasm-bindgen-test` harness) and a true backpressure
+  assertion (item 12).

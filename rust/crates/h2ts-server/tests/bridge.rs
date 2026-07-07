@@ -4,9 +4,13 @@
 //!
 //! The receive-path tests push large / fragmented / control frames at wslay,
 //! which is the one place it must never buffer a whole frame.
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use fastwebsockets::{Frame, OpCode, Payload, Role, WebSocket};
-use h2ts_server::bridge;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use h2ts_server::{bridge, bridge_with, BridgeConfig, CloseFrame};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 #[tokio::test]
 async fn bridge_forwards_bytes_both_directions() {
@@ -170,4 +174,117 @@ async fn bridge_propagates_client_close_to_peer() {
     let mut buf = [0u8; 16];
     let n = peer_test.read(&mut buf).await.unwrap();
     assert_eq!(n, 0, "peer should observe EOF after the client close");
+}
+
+// --- Teardown reason surfacing -------------------------------------------
+//
+// Every close test above sends a proper Close frame (the `PeerClose` path). The
+// two below cover the *abnormal* endings — a transport drop and a write failure —
+// which are the common real-world teardowns and both surface as 1006.
+
+/// The WS transport dying **without** a Close frame — a dropped TCP connection,
+/// the common network-drop / killed-tab case — ends the bridge as *abnormal*:
+/// `on_close` fires with 1006 (RFC 6455 §7.1.5), distinct from every clean close.
+#[tokio::test]
+async fn bridge_reports_1006_on_transport_drop_without_close() {
+    let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+    // Keep the peer bound so only the WS side ends the bridge.
+    let (peer_for_bridge, _peer_test) = tokio::io::duplex(16 * 1024);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CloseFrame>();
+    let config = BridgeConfig {
+        on_close: Some(Box::new(move |cf: &CloseFrame| {
+            let _ = tx.send(cf.clone());
+        })),
+        ..Default::default()
+    };
+    tokio::spawn(async move {
+        let _ = bridge_with(server_io, peer_for_bridge, config).await;
+    });
+
+    // Drop the client transport outright — no Close frame, just EOF.
+    drop(client_io);
+
+    let got = rx
+        .recv()
+        .await
+        .expect("on_close should fire on abnormal end");
+    assert_eq!(got.code, 1006, "abnormal closure code");
+    assert!(got.reason.is_empty(), "no reason on an abnormal close");
+}
+
+/// A peer whose writes always fail and whose reads never complete. This forces the
+/// bridge's *write-failure* teardown deterministically: a plain duplex signals
+/// read-EOF and write-error together, racing the two teardown branches, so the
+/// write-error path can't be isolated with one. Reads park forever (never EOF) so
+/// only a write error can end the bridge.
+struct FailingPeer;
+
+impl AsyncRead for FailingPeer {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Pending
+    }
+}
+
+impl AsyncWrite for FailingPeer {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "peer write failed",
+        )))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// A write failure while forwarding data to the peer tears the bridge down with an
+/// error, surfaced to `on_close` as 1006 carrying the io error text — the error
+/// path of the whole pump.
+#[tokio::test]
+async fn bridge_reports_1006_with_reason_on_peer_write_failure() {
+    let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CloseFrame>();
+    let config = BridgeConfig {
+        on_close: Some(Box::new(move |cf: &CloseFrame| {
+            let _ = tx.send(cf.clone());
+        })),
+        ..Default::default()
+    };
+    tokio::spawn(async move {
+        let _ = bridge_with(server_io, FailingPeer, config).await;
+    });
+
+    // Client sends data → the bridge decodes it and tries to write it to the peer,
+    // whose write fails → the bridge tears down with that error.
+    let mut client_ws = WebSocket::after_handshake(client_io, Role::Client);
+    client_ws
+        .write_frame(Frame::binary(Payload::Owned(b"trigger".to_vec())))
+        .await
+        .unwrap();
+
+    let got = rx
+        .recv()
+        .await
+        .expect("on_close should fire on write failure");
+    assert_eq!(got.code, 1006, "an errored teardown surfaces as abnormal");
+    assert!(
+        got.reason.contains("peer write failed"),
+        "the io error text is surfaced, got {:?}",
+        got.reason
+    );
 }

@@ -201,6 +201,59 @@ fn allow_implicit_codec_accepts_the_first_offered_codec() {
     assert!(resp.headers().get(SEC_WEBSOCKET_PROTOCOL).is_none());
 }
 
+/// A request that isn't a WebSocket upgrade is rejected with `NotUpgradeRequest`,
+/// whose rejection response is `426 Upgrade Required` — the arm all the accept
+/// tests above (which use valid upgrades) never reach.
+#[test]
+fn accept_rejects_a_non_upgrade_request_with_426() {
+    // A plain GET: no Upgrade / Connection / Sec-WebSocket-Key.
+    let mut plain = Request::builder().body(()).unwrap();
+    let err = accept(&mut plain)
+        .err()
+        .expect("a non-upgrade request must be rejected");
+    assert!(matches!(err, WebSocketError::NotUpgradeRequest));
+    assert_eq!(
+        err.rejection_response().status(),
+        StatusCode::UPGRADE_REQUIRED
+    );
+
+    // A partial upgrade (all signals but the key) is also not an upgrade → 426,
+    // not the 400 an unsupported-subprotocol reject would give.
+    let mut no_key = Request::builder()
+        .header(UPGRADE, "websocket")
+        .header(CONNECTION, "Upgrade")
+        .body(())
+        .unwrap();
+    let err = accept(&mut no_key)
+        .err()
+        .expect("a request missing Sec-WebSocket-Key must be rejected");
+    assert!(matches!(err, WebSocketError::NotUpgradeRequest));
+    assert_eq!(
+        err.rejection_response().status(),
+        StatusCode::UPGRADE_REQUIRED
+    );
+}
+
+/// `rejection_response` maps each *constructible* pre-upgrade error to its status.
+/// (`Upgrade(_)` maps to `500`, but wraps a `hyper::Error` with no public
+/// constructor, so it's only reachable through a live post-101 upgrade failure and
+/// isn't unit-constructible here.)
+#[test]
+fn rejection_response_maps_constructible_errors_to_status() {
+    assert_eq!(
+        WebSocketError::NotUpgradeRequest
+            .rejection_response()
+            .status(),
+        StatusCode::UPGRADE_REQUIRED
+    );
+    assert_eq!(
+        WebSocketError::UnsupportedSubprotocol
+            .rejection_response()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+}
+
 #[test]
 fn accept_key_derivation_matches_rfc_6455_example() {
     // RFC 6455 §1.3: key "dGhlIHNhbXBsZSBub25jZQ==" -> Sec-WebSocket-Accept

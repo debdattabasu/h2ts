@@ -232,6 +232,91 @@ async fn keepalive_closes_peer_on_no_pong() {
     assert_eq!(surfaced.reason, "keepalive timeout");
 }
 
+/// A custom `KeepAlive.close` (not the default 1001 "keepalive timeout") is the
+/// close the peer receives *and* the reason surfaced to `on_close` when keepalive
+/// fails — the struct's `close` field is honored, not just its timing.
+#[tokio::test]
+async fn keepalive_uses_a_custom_close_frame() {
+    let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+    let (peer_for_bridge, _peer_test) = tokio::io::duplex(16 * 1024);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CloseFrame>();
+    let config = BridgeConfig {
+        keepalive: Some(KeepAlive {
+            interval: Duration::from_millis(50),
+            timeout: Duration::from_millis(50),
+            close: CloseFrame {
+                code: 4020,
+                reason: "custom-bye".to_string(),
+            },
+        }),
+        on_close: Some(Box::new(move |cf: &CloseFrame| {
+            let _ = tx.send(cf.clone());
+        })),
+        ..Default::default()
+    };
+    tokio::spawn(async move {
+        let _ = bridge_with(server_io, peer_for_bridge, config).await;
+    });
+
+    // A client that ignores pings → keepalive fires the custom close.
+    let mut client_ws = WebSocket::after_handshake(client_io, Role::Client);
+    client_ws.set_auto_pong(false);
+    client_ws.set_auto_close(false);
+
+    let ping = client_ws.read_frame().await.unwrap();
+    assert_eq!(ping.opcode, OpCode::Ping);
+    let close = client_ws.read_frame().await.unwrap();
+    assert_eq!(close.opcode, OpCode::Close);
+    let payload = close.payload.to_vec();
+    assert_eq!(u16::from_be_bytes([payload[0], payload[1]]), 4020);
+    assert_eq!(&payload[2..], b"custom-bye");
+
+    let surfaced = rx.recv().await.unwrap();
+    assert_eq!(surfaced.code, 4020);
+    assert_eq!(surfaced.reason, "custom-bye");
+}
+
+/// Once the bridge has ended, a `WsControl` send fails with `BrokenPipe` — the
+/// documented contract (its receiver is dropped when the bridge tears down).
+#[tokio::test]
+async fn wscontrol_send_fails_after_the_bridge_ends() {
+    let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+    let (peer_for_bridge, _peer_test) = tokio::io::duplex(16 * 1024);
+
+    let (control, control_rx) = control_channel();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CloseFrame>();
+    let config = BridgeConfig {
+        control: Some(control_rx),
+        on_close: Some(Box::new(move |cf: &CloseFrame| {
+            let _ = tx.send(cf.clone());
+        })),
+        ..Default::default()
+    };
+    tokio::spawn(async move {
+        let _ = bridge_with(server_io, peer_for_bridge, config).await;
+    });
+
+    // The handle works while the bridge is live.
+    control.ping(b"alive".to_vec()).unwrap();
+
+    // End the bridge: dropping the client transport EOFs the WS side. `on_close`
+    // firing means the bridge task has finished and dropped its ControlReceiver.
+    drop(client_io);
+    let _ = rx
+        .recv()
+        .await
+        .expect("on_close should fire when the bridge ends");
+
+    // Every control send now fails with BrokenPipe.
+    let err = control.close(1000, "too late").unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    assert_eq!(
+        control.ping(b"x".to_vec()).unwrap_err().kind(),
+        std::io::ErrorKind::BrokenPipe
+    );
+}
+
 /// A peer that auto-answers pings keeps the tunnel alive across many keepalive
 /// intervals — data still flows and no close is sent.
 #[tokio::test]
