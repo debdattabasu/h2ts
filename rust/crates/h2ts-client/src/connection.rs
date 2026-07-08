@@ -799,7 +799,11 @@ impl ConnState {
             stream_id: id,
             error_code: code.value(),
         });
-        self.streams.remove(&id);
+        // Fail the pending request/body with a proper error rather than relying on
+        // the dropped head sender surfacing a generic "connection closed".
+        if let Some(mut s) = self.streams.remove(&id) {
+            s.fail(H2Error::stream(code, format!("stream {id} reset"), id));
+        }
         self.wake_slot_waiters();
     }
 

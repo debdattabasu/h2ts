@@ -13,7 +13,7 @@ use futures::task::LocalSpawnExt;
 use futures::{SinkExt, StreamExt};
 
 use h2ts_client::frames::{serialize_frame, Frame, FrameDecoder, Settings};
-use h2ts_client::hpack::{Header, HpackEncoder};
+use h2ts_client::hpack::{Header, HpackDecoder, HpackEncoder};
 use h2ts_client::{connect, ConnectOptions, RequestBody, RequestInit, Transport, TransportError};
 
 /// The HTTP/2 client connection preface (RFC 7540 §3.5).
@@ -1551,6 +1551,292 @@ fn honors_the_peers_max_concurrent_streams() {
             .unwrap();
 
         assert_eq!(done_rx.await.unwrap(), 200);
+    });
+}
+
+#[test]
+fn stream_window_update_zero_resets_only_the_stream() {
+    // §6.9.1: a stream-level WINDOW_UPDATE with a 0 increment is a stream error —
+    // the client RST_STREAMs the stream and fails the request, but the connection
+    // survives.
+    let mut pool = LocalPool::new();
+    let sp = pool.spawner();
+    let (transport, c2s_rx, s2c_tx) = mock_transport();
+    let (conn, driver) = connect(transport, ConnectOptions::default());
+    sp.spawn_local(driver).unwrap();
+
+    pool.run_until(async move {
+        let conn_probe = conn.clone();
+        let client = async move {
+            let res = conn
+                .request(RequestInit {
+                    path: Some("/x".into()),
+                    authority: Some("e".into()),
+                    ..Default::default()
+                })
+                .await;
+            assert!(res.is_err(), "request should error, not hang");
+        };
+        let server = async move {
+            let mut server = ServerSide::new(c2s_rx);
+            server.read_preface().await;
+            assert!(matches!(server.next_frame().await, Frame::Settings { .. }));
+            assert!(matches!(
+                server.next_frame().await,
+                Frame::Headers { stream_id: 1, .. }
+            ));
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::WindowUpdate {
+                    stream_id: 1,
+                    window_size_increment: 0,
+                }))
+                .unwrap();
+            loop {
+                if matches!(server.next_frame().await, Frame::RstStream { stream_id: 1, .. }) {
+                    break;
+                }
+            }
+        };
+        futures::join!(client, server);
+        assert!(
+            !conn_probe.is_closed(),
+            "the connection should survive a single stream reset"
+        );
+    });
+}
+
+#[test]
+fn a_frame_over_max_frame_size_tears_down_with_goaway() {
+    // A frame whose length exceeds our advertised SETTINGS_MAX_FRAME_SIZE (16384)
+    // is a FRAME_SIZE_ERROR: the client emits GOAWAY and closes.
+    let mut pool = LocalPool::new();
+    let sp = pool.spawner();
+    let (transport, c2s_rx, s2c_tx) = mock_transport();
+    let (conn, driver) = connect(transport, ConnectOptions::default());
+    sp.spawn_local(driver).unwrap();
+
+    pool.run_until(async move {
+        let conn_probe = conn.clone();
+        let client = async move {
+            let res = conn
+                .request(RequestInit {
+                    path: Some("/x".into()),
+                    authority: Some("e".into()),
+                    ..Default::default()
+                })
+                .await;
+            assert!(res.is_err());
+        };
+        let server = async move {
+            let mut server = ServerSide::new(c2s_rx);
+            server.read_preface().await;
+            assert!(matches!(server.next_frame().await, Frame::Settings { .. }));
+            assert!(matches!(
+                server.next_frame().await,
+                Frame::Headers { stream_id: 1, .. }
+            ));
+            // 20000 bytes > the default 16384 max frame size.
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Data {
+                    stream_id: 1,
+                    data: vec![0u8; 20000],
+                    end_stream: false,
+                }))
+                .unwrap();
+            loop {
+                if matches!(server.next_frame().await, Frame::Goaway { .. }) {
+                    break;
+                }
+            }
+        };
+        futures::join!(client, server);
+        assert!(conn_probe.is_closed());
+    });
+}
+
+#[test]
+fn strips_padding_from_a_padded_headers_frame() {
+    // A padded HEADERS frame on receive: the client strips the padding and decodes
+    // the header block (only padded DATA was covered before).
+    let mut pool = LocalPool::new();
+    let sp = pool.spawner();
+    let (transport, c2s_rx, s2c_tx) = mock_transport();
+    let (conn, driver) = connect(transport, ConnectOptions::default());
+    sp.spawn_local(driver).unwrap();
+
+    pool.run_until(async move {
+        let client = async move {
+            let res = conn
+                .request(RequestInit {
+                    path: Some("/x".into()),
+                    authority: Some("e".into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(res.status, 200);
+        };
+        let server = async move {
+            let mut server = ServerSide::new(c2s_rx);
+            server.read_preface().await;
+            assert!(matches!(server.next_frame().await, Frame::Settings { .. }));
+            assert!(matches!(
+                server.next_frame().await,
+                Frame::Headers { stream_id: 1, .. }
+            ));
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Settings {
+                    ack: false,
+                    settings: Settings::default(),
+                }))
+                .unwrap();
+            // Hand-build a PADDED HEADERS frame (serialize_frame doesn't emit padding).
+            let block = HpackEncoder::new().encode(&[Header::new(":status", "200")]);
+            let pad_len = 4usize;
+            let mut payload = Vec::new();
+            payload.push(pad_len as u8);
+            payload.extend_from_slice(&block);
+            payload.resize(payload.len() + pad_len, 0); // padding
+            let mut frame = Vec::new();
+            let len = payload.len();
+            frame.push(((len >> 16) & 0xff) as u8);
+            frame.push(((len >> 8) & 0xff) as u8);
+            frame.push((len & 0xff) as u8);
+            frame.push(0x1); // HEADERS
+            frame.push(0x4 | 0x8); // END_HEADERS | PADDED
+            frame.extend_from_slice(&[0, 0, 0, 1]); // stream 1
+            frame.extend_from_slice(&payload);
+            s2c_tx.unbounded_send(frame).unwrap();
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Data {
+                    stream_id: 1,
+                    data: Vec::new(),
+                    end_stream: true,
+                }))
+                .unwrap();
+        };
+        futures::join!(client, server);
+    });
+}
+
+#[test]
+fn refuses_an_inbound_push_promise() {
+    // The client refuses server push (no on_push): an inbound PUSH_PROMISE is
+    // answered with RST_STREAM(REFUSED_STREAM) on the promised stream.
+    let mut pool = LocalPool::new();
+    let sp = pool.spawner();
+    let (transport, c2s_rx, s2c_tx) = mock_transport();
+    let (conn, driver) = connect(transport, ConnectOptions::default());
+    sp.spawn_local(driver).unwrap();
+
+    sp.spawn_local(async move {
+        let _ = conn
+            .request(RequestInit {
+                path: Some("/x".into()),
+                authority: Some("e".into()),
+                ..Default::default()
+            })
+            .await;
+    })
+    .unwrap();
+
+    pool.run_until(async move {
+        let mut server = ServerSide::new(c2s_rx);
+        server.read_preface().await;
+        assert!(matches!(server.next_frame().await, Frame::Settings { .. }));
+        assert!(matches!(
+            server.next_frame().await,
+            Frame::Headers { stream_id: 1, .. }
+        ));
+        let push = HpackEncoder::new().encode(&[
+            Header::new(":method", "GET"),
+            Header::new(":scheme", "http"),
+            Header::new(":authority", "e"),
+            Header::new(":path", "/pushed"),
+        ]);
+        s2c_tx
+            .unbounded_send(serialize_frame(&Frame::PushPromise {
+                stream_id: 1,
+                promised_stream_id: 2,
+                header_block_fragment: push,
+                end_headers: true,
+            }))
+            .unwrap();
+        loop {
+            match server.next_frame().await {
+                Frame::RstStream {
+                    stream_id: 2,
+                    error_code,
+                } => {
+                    assert_eq!(error_code, 7); // REFUSED_STREAM
+                    break;
+                }
+                _ => continue,
+            }
+        }
+    });
+}
+
+#[test]
+fn splits_an_oversized_request_header_block_on_send() {
+    // A request header block larger than the peer's max frame size is split across
+    // HEADERS + CONTINUATION, and reassembles to the original headers.
+    let mut pool = LocalPool::new();
+    let sp = pool.spawner();
+    let (transport, c2s_rx, _s2c_tx) = mock_transport();
+    let (conn, driver) = connect(transport, ConnectOptions::default());
+    sp.spawn_local(driver).unwrap();
+
+    // Big enough that even Huffman-coded (~5 bits/char) it exceeds 16384.
+    let big = "a".repeat(40000);
+    let big_send = big.clone();
+    sp.spawn_local(async move {
+        let _ = conn
+            .request(RequestInit {
+                path: Some("/x".into()),
+                authority: Some("e".into()),
+                headers: vec![("x-big".into(), big_send)],
+                ..Default::default()
+            })
+            .await;
+    })
+    .unwrap();
+
+    pool.run_until(async move {
+        let mut server = ServerSide::new(c2s_rx);
+        server.read_preface().await;
+        assert!(matches!(server.next_frame().await, Frame::Settings { .. }));
+
+        let mut fragments: Vec<u8> = Vec::new();
+        match server.next_frame().await {
+            Frame::Headers {
+                stream_id: 1,
+                header_block_fragment,
+                end_headers,
+                ..
+            } => {
+                assert!(!end_headers, "block should not fit one HEADERS frame");
+                fragments.extend_from_slice(&header_block_fragment);
+            }
+            _ => panic!("expected HEADERS"),
+        }
+        loop {
+            match server.next_frame().await {
+                Frame::Continuation {
+                    header_block_fragment,
+                    end_headers,
+                    ..
+                } => {
+                    fragments.extend_from_slice(&header_block_fragment);
+                    if end_headers {
+                        break;
+                    }
+                }
+                _ => panic!("expected CONTINUATION"),
+            }
+        }
+        let decoded = HpackDecoder::new(4096).decode(&fragments).unwrap();
+        assert!(decoded.iter().any(|h| h.name == "x-big" && h.value == big));
     });
 }
 

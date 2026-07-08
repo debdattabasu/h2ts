@@ -2,11 +2,11 @@
 // frames from the peer — RST_STREAM mid-transfer, GOAWAY. Mirrors the Rust
 // client's tests/connection.rs cases so the two clients stay reconciled.
 import { describe, expect, it } from "vitest";
-import { decodeUtf8, encodeUtf8 } from "../src/bytes.js";
+import { concatBytes, decodeUtf8, encodeUtf8 } from "../src/bytes.js";
 import { connect } from "../src/client.js";
 import { FrameDecoder, serializeFrame } from "../src/frames/codec.js";
 import { FrameType, type Frame } from "../src/frames/types.js";
-import { HpackEncoder } from "../src/hpack/hpack.js";
+import { HpackDecoder, HpackEncoder } from "../src/hpack/hpack.js";
 import type { Transport } from "../src/transport/transport.js";
 
 /** Server helper: SETTINGS + response HEADERS(:status 200, no END_STREAM). */
@@ -231,6 +231,136 @@ describe("receive path: interim responses, settings validation, header cap", () 
     expect(goaway.type).toBe(FrameType.GOAWAY);
     await expect(reqP).rejects.toThrow();
     expect(conn.isClosed).toBe(true);
+  }, 8000);
+});
+
+describe("receive path: coverage gaps", () => {
+  it("resets only the stream on a stream-level WINDOW_UPDATE(0)", async () => {
+    const { transport, clientReader, serverWriter } = mockTransport();
+    const conn = connect(transport);
+    const frames = new FrameReader(clientReader);
+    const reqP = conn.request({ path: "/x", authority: "e" });
+    reqP.catch(() => {});
+    await frames.until((f) => f.type === FrameType.HEADERS);
+
+    // §6.9.1: a stream WINDOW_UPDATE with a 0 increment is a stream error.
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.WINDOW_UPDATE, streamId: 1, windowSizeIncrement: 0 }),
+    );
+
+    const rst = await frames.until((f) => f.type === FrameType.RST_STREAM && f.streamId === 1);
+    expect(rst.type).toBe(FrameType.RST_STREAM);
+    await expect(reqP).rejects.toThrow(); // request fails (not hang)
+    expect(conn.isClosed).toBe(false); // ...but the connection survives
+  }, 8000);
+
+  it("tears down with a GOAWAY on a frame larger than the advertised max", async () => {
+    const { transport, clientReader, serverWriter } = mockTransport();
+    const conn = connect(transport);
+    const frames = new FrameReader(clientReader);
+    const reqP = conn.request({ path: "/x", authority: "e" });
+    reqP.catch(() => {});
+    await frames.until((f) => f.type === FrameType.HEADERS);
+
+    // 20000 bytes exceeds the default 16384 SETTINGS_MAX_FRAME_SIZE.
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.DATA, streamId: 1, data: new Uint8Array(20000), endStream: false }),
+    );
+
+    const goaway = await frames.until((f) => f.type === FrameType.GOAWAY);
+    expect(goaway.type).toBe(FrameType.GOAWAY);
+    await expect(reqP).rejects.toThrow();
+    expect(conn.isClosed).toBe(true);
+  }, 8000);
+
+  it("strips padding from a padded HEADERS frame on receive", async () => {
+    const { transport, clientReader, serverWriter } = mockTransport();
+    const conn = connect(transport);
+    const frames = new FrameReader(clientReader);
+    const reqP = conn.request({ path: "/x", authority: "e" });
+    await frames.until((f) => f.type === FrameType.HEADERS);
+    void frames.drain();
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.SETTINGS, streamId: 0, ack: false, settings: {} }),
+    );
+
+    // Hand-build a PADDED HEADERS frame (serializeFrame doesn't emit padding).
+    const block = new HpackEncoder().encode([{ name: ":status", value: "200" }]);
+    const padLen = 4;
+    const payload = new Uint8Array(1 + block.length + padLen);
+    payload[0] = padLen; // pad length
+    payload.set(block, 1); // ...then the block, then `padLen` zero bytes
+    const header = new Uint8Array(9);
+    const len = payload.length;
+    header[0] = (len >> 16) & 0xff;
+    header[1] = (len >> 8) & 0xff;
+    header[2] = len & 0xff;
+    header[3] = 0x1; // HEADERS
+    header[4] = 0x4 | 0x8; // END_HEADERS | PADDED
+    header[8] = 1; // stream 1
+    await serverWriter.write(concatBytes([header, payload]));
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.DATA, streamId: 1, data: new Uint8Array(0), endStream: true }),
+    );
+
+    const res = await reqP;
+    expect(res.status).toBe(200); // padding stripped, headers decoded
+  }, 8000);
+
+  it("refuses an inbound PUSH_PROMISE with RST_STREAM (REFUSED_STREAM)", async () => {
+    const { transport, clientReader, serverWriter } = mockTransport();
+    const conn = connect(transport); // no onPush → pushes refused
+    const frames = new FrameReader(clientReader);
+    const reqP = conn.request({ path: "/x", authority: "e" });
+    reqP.catch(() => {});
+    await frames.until((f) => f.type === FrameType.HEADERS && f.streamId === 1);
+
+    const pushHeaders = new HpackEncoder().encode([
+      { name: ":method", value: "GET" },
+      { name: ":scheme", value: "http" },
+      { name: ":authority", value: "e" },
+      { name: ":path", value: "/pushed" },
+    ]);
+    await serverWriter.write(
+      serializeFrame({
+        type: FrameType.PUSH_PROMISE,
+        streamId: 1,
+        promisedStreamId: 2,
+        headerBlockFragment: pushHeaders,
+        endHeaders: true,
+      }),
+    );
+
+    const rst = await frames.until((f) => f.type === FrameType.RST_STREAM && f.streamId === 2);
+    if (rst.type === FrameType.RST_STREAM) expect(rst.errorCode).toBe(7); // REFUSED_STREAM
+  }, 8000);
+
+  it("splits an oversized request header block into HEADERS + CONTINUATION on send", async () => {
+    const { transport, clientReader } = mockTransport();
+    const conn = connect(transport);
+    const frames = new FrameReader(clientReader);
+
+    // Big enough that even Huffman-coded (~5 bits/char) the block exceeds the
+    // default 16384 max frame size, forcing a HEADERS + CONTINUATION split.
+    const bigValue = "a".repeat(40000);
+    const reqP = conn.request({ path: "/x", authority: "e", headers: { "x-big": bigValue } });
+    reqP.catch(() => {});
+
+    const h = await frames.until((f) => f.type === FrameType.HEADERS);
+    const fragments: Uint8Array[] = [];
+    if (h.type === FrameType.HEADERS) {
+      expect(h.endHeaders).toBe(false); // didn't fit one frame
+      fragments.push(h.headerBlockFragment);
+    }
+    for (;;) {
+      const c = await frames.next();
+      if (c.type === FrameType.CONTINUATION) {
+        fragments.push(c.headerBlockFragment);
+        if (c.endHeaders) break;
+      }
+    }
+    const decoded = new HpackDecoder().decode(concatBytes(fragments));
+    expect(decoded.some((hd) => hd.name === "x-big" && hd.value === bigValue)).toBe(true);
   }, 8000);
 });
 

@@ -465,8 +465,9 @@ export class H2Connection {
       }
       init.signal.addEventListener("abort", () => {
         if (this.streams.has(id)) {
-          this.resetStream(id, "CANCEL");
+          // Fail with the abort reason first, so resetStream's generic fail is a no-op.
           stream.fail(abortError(init.signal!));
+          this.resetStream(id, "CANCEL");
         }
       }, { once: true });
     }
@@ -477,8 +478,8 @@ export class H2Connection {
 
     if (hasBody) {
       this.pumpBody(stream, init.body!).catch((err) => {
+        stream.fail(err); // fail with the pump error first
         if (this.streams.has(id)) this.resetStream(id, "CANCEL");
-        stream.fail(err);
       });
     }
 
@@ -598,6 +599,9 @@ export class H2Connection {
       stream.state = "closed";
       this.streams.delete(id);
       this.wakeStreamSlots();
+      // Fail the pending request/body so it never hangs. Idempotent: a caller that
+      // already failed the stream with a more specific error keeps that error.
+      stream.fail(new H2Error(code, `stream ${id} reset`, id));
     }
   }
 
