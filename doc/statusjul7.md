@@ -129,12 +129,19 @@ TS client 42, Rust client connection suite 20; TS typecheck clean.
   `resetStream` now fails the stream (Rust `reset_stream` likewise fails it with a proper error
   rather than a generic dropped-sender cancel).
 
+### Fixed — round 6 (2026-07-09)
+
+- **Conformance battery hardened with trailers + 1xx (e2e).** The Node h2c origin gained
+  `/trailers` (a HEADERS block after DATA) and `/early-hints` (a `103` informational before the
+  final `200`); the battery (TS `run.mjs`, Rust native, Rust wasm) asserts the client surfaces
+  trailers and treats the 1xx as non-final. Now **20 checks** pass e2e for all three clients
+  through the real `h2ts-proxy` → origin. (Early-complete/constrained-window stay unit-only — see
+  §3.)
+
 ### Still open (deferred / needs a decision)
 
 - **`Origin` allowlist + `Sec-WebSocket-Version` negotiation [#11] — LOW/security.** Needs a
   config/policy decision.
-- **Extend the conformance origin** to drive early-complete / 1xx / trailers / constrained-window
-  so the shared battery catches these instead of relying on hand-written mirror tests.
 
 ---
 
@@ -145,9 +152,12 @@ mirrored unit tests instead. **Closed in round 5** (both clients): stream-level
 `WINDOW_UPDATE(0)` → RST_STREAM (which also surfaced + fixed a real TS hang — see round 5),
 frame > `MAX_FRAME_SIZE` → GOAWAY, padded HEADERS on receive, inbound PUSH_PROMISE refused,
 and oversized-header split on *send*. (1xx and receive backpressure were closed in rounds 2/4.)
-**Still open:** extending the conformance origin itself to drive early-complete / 1xx /
-trailers / constrained-window, so the shared battery — not just hand-written mirror tests —
-catches this class.
+**Round 6:** the conformance origin now drives **trailers** and **1xx (103 Early Hints)** so all
+three clients (TS, Rust native, Rust wasm) exercise them e2e through the real gateway. Early-
+complete and constrained-window stay unit-test-only by design: an early complete response can't
+be asserted e2e (the request resolves whether or not the upload silently truncated — the unit
+tests assert the remaining DATA + END_STREAM), and constrained-window flow control is already
+exercised by the 512 KiB upload through the origin's 64 KiB window.
 
 ---
 
@@ -211,5 +221,9 @@ catches this class.
   reset); fixed in both clients. **Suites green:** TS client 58, Rust client 61 (connection 30 +
   pool 5 + frames 11 + hpack 15); Rust server 20; clippy clean (native + wasm32); conformance
   16/16 both clients.
-- [ ] Still open (see §2 "Still open"): `Origin`/`Sec-WebSocket-Version` [#11]; extend the
-  conformance origin to drive early-complete / 1xx / trailers / constrained-window.
+- [x] **Round 6 — conformance battery: trailers + 1xx e2e** — _done 2026-07-09._ Added
+  `/trailers` and `/early-hints` (103) routes to the Node h2c origin and matching checks to all
+  three client batteries (TS `run.mjs`, Rust native, Rust wasm). **20/20 pass** e2e for TS, Rust,
+  and wasm through `h2ts-proxy` → origin. (Cleared a stale origin process left by an earlier
+  aborted run first.)
+- [ ] Still open (see §2 "Still open"): `Origin`/`Sec-WebSocket-Version` [#11] — the last item.
