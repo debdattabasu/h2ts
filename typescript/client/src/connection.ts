@@ -21,6 +21,9 @@ import type {
 const CONNECTION_PREFACE = encodeUtf8("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
 const SPEC_INITIAL_WINDOW = 65535;
 const EMPTY = new Uint8Array(0);
+// Cap on the accumulated header block (HEADERS + CONTINUATION) so an endless
+// CONTINUATION stream can't exhaust memory (RFC 9113 §10.5.1 / CVE-2024-27316).
+const MAX_HEADER_BLOCK_SIZE = 1 << 20; // 1 MiB — far above any real header block
 
 // Headers that are connection-specific and MUST NOT appear in HTTP/2 (§8.1.2.2).
 const FORBIDDEN_HEADERS = new Set([
@@ -38,6 +41,8 @@ interface PendingHeaderBlock {
   endStream: boolean;
   promisedStreamId?: number;
   fragments: Uint8Array[];
+  /** Running total of fragment bytes, checked against MAX_HEADER_BLOCK_SIZE. */
+  size: number;
 }
 
 interface RemoteSettings {
@@ -45,6 +50,9 @@ interface RemoteSettings {
   maxFrameSize: number;
   headerTableSize: number;
   enablePush: boolean;
+  /** Peer's SETTINGS_MAX_CONCURRENT_STREAMS — the cap on our open streams
+   * (§5.1.2). Infinity until the peer advertises one. */
+  maxConcurrentStreams: number;
 }
 
 export class H2Connection {
@@ -67,7 +75,11 @@ export class H2Connection {
     maxFrameSize: DEFAULT_MAX_FRAME_SIZE,
     headerTableSize: 4096,
     enablePush: true,
+    maxConcurrentStreams: Number.POSITIVE_INFINITY,
   };
+
+  /** Requests parked waiting for a concurrent-stream slot to free up (§5.1.2). */
+  private readonly streamSlotWaiters: Array<() => void> = [];
 
   private pendingHeaderBlock: PendingHeaderBlock | undefined;
   private writeQueue: Promise<void> = Promise.resolve();
@@ -199,7 +211,9 @@ export class H2Connection {
           kind: "response",
           endStream: frame.endStream,
           fragments: [frame.headerBlockFragment],
+          size: frame.headerBlockFragment.length,
         };
+        this.guardHeaderBlockSize();
         if (frame.endHeaders) this.completeHeaderBlock();
         return;
 
@@ -209,6 +223,8 @@ export class H2Connection {
           throw new H2Error("PROTOCOL_ERROR", "unexpected CONTINUATION");
         }
         pb.fragments.push(frame.headerBlockFragment);
+        pb.size += frame.headerBlockFragment.length;
+        this.guardHeaderBlockSize();
         if (frame.endHeaders) this.completeHeaderBlock();
         return;
       }
@@ -220,7 +236,9 @@ export class H2Connection {
           endStream: false,
           promisedStreamId: frame.promisedStreamId,
           fragments: [frame.headerBlockFragment],
+          size: frame.headerBlockFragment.length,
         };
+        this.guardHeaderBlockSize();
         if (frame.endHeaders) this.completeHeaderBlock();
         return;
 
@@ -235,7 +253,14 @@ export class H2Connection {
         }
         if (stream) {
           stream.receiveData(frame.data, frame.endStream);
-          if (frame.endStream) this.retireStream(frame.streamId);
+          // The peer half-closing does NOT end the stream while we are still
+          // uploading — it becomes half-closed(remote) and our body pump (plus
+          // any WINDOW_UPDATEs for it) must keep working. Retire only when both
+          // directions are done (RFC 7540 §5.1).
+          if (frame.endStream) {
+            stream.remoteClosed = true;
+            this.retireIfFullyClosed(frame.streamId);
+          }
         }
         return;
       }
@@ -282,12 +307,21 @@ export class H2Connection {
             this.streams.delete(id);
           }
         }
+        this.wakeStreamSlots(); // parked requests now reject (going away)
         if (frame.errorCode !== 0) this.destroy(err);
         return;
       }
 
       case FrameType.PRIORITY:
         return; // prioritization not implemented
+    }
+  }
+
+  /** Bound the accumulated header block so an endless CONTINUATION stream can't
+   * exhaust memory (RFC 9113 §10.5.1 / CVE-2024-27316). */
+  private guardHeaderBlockSize(): void {
+    if (this.pendingHeaderBlock && this.pendingHeaderBlock.size > MAX_HEADER_BLOCK_SIZE) {
+      throw new H2Error("ENHANCE_YOUR_CALM", "header block exceeds the maximum size");
     }
   }
 
@@ -298,8 +332,14 @@ export class H2Connection {
     const headers = this.decoder.decode(block); // HPACK decode (connection-global)
 
     if (pb.kind === "response") {
-      this.streams.get(pb.streamId)?.receiveHeaders(headers, pb.endStream);
-      if (pb.endStream) this.retireStream(pb.streamId);
+      const stream = this.streams.get(pb.streamId);
+      if (stream) {
+        stream.receiveHeaders(headers, pb.endStream);
+        if (pb.endStream) {
+          stream.remoteClosed = true;
+          this.retireIfFullyClosed(pb.streamId);
+        }
+      }
     } else {
       this.handlePush(pb.streamId, pb.promisedStreamId!, headers);
     }
@@ -307,13 +347,49 @@ export class H2Connection {
 
   private applyRemoteSettings(s: Settings): void {
     if (s.initialWindowSize !== undefined) {
+      // §6.5.2: a window above 2^31-1 is a FLOW_CONTROL_ERROR.
+      if (s.initialWindowSize > 0x7fffffff) {
+        throw new H2Error("FLOW_CONTROL_ERROR", "SETTINGS_INITIAL_WINDOW_SIZE exceeds 2^31-1");
+      }
       const delta = s.initialWindowSize - this.remote.initialWindowSize;
       this.remote.initialWindowSize = s.initialWindowSize;
       for (const stream of this.streams.values()) stream.sendWindow.adjust(delta);
     }
-    if (s.maxFrameSize !== undefined) this.remote.maxFrameSize = s.maxFrameSize;
+    if (s.maxFrameSize !== undefined) {
+      // §6.5.2: MAX_FRAME_SIZE must be within 2^14..2^24-1.
+      if (s.maxFrameSize < 16384 || s.maxFrameSize > 16777215) {
+        throw new H2Error("PROTOCOL_ERROR", "SETTINGS_MAX_FRAME_SIZE out of range");
+      }
+      this.remote.maxFrameSize = s.maxFrameSize;
+    }
     if (s.headerTableSize !== undefined) this.remote.headerTableSize = s.headerTableSize;
     if (s.enablePush !== undefined) this.remote.enablePush = s.enablePush;
+    if (s.maxConcurrentStreams !== undefined) {
+      this.remote.maxConcurrentStreams = s.maxConcurrentStreams;
+      this.wakeStreamSlots(); // a raised limit may free parked requests
+    }
+  }
+
+  // --- concurrent-stream limiting (§5.1.2) ---
+
+  /** Client-initiated (odd-id) streams currently open or half-closed — the ones
+   * that count toward the peer's SETTINGS_MAX_CONCURRENT_STREAMS. */
+  get activeStreams(): number {
+    let n = 0;
+    for (const id of this.streams.keys()) if (id % 2 === 1) n++;
+    return n;
+  }
+
+  /** True if opening another request stream would stay within the peer's limit. */
+  canOpenStream(): boolean {
+    return this.activeStreams < this.remote.maxConcurrentStreams;
+  }
+
+  /** Wake every parked request so it re-checks for a free slot (or a teardown). */
+  private wakeStreamSlots(): void {
+    if (this.streamSlotWaiters.length === 0) return;
+    const pending = this.streamSlotWaiters.splice(0);
+    for (const resolve of pending) resolve();
   }
 
   private handlePush(parentId: number, promisedId: number, requestHeaders: Header[]): void {
@@ -325,6 +401,9 @@ export class H2Connection {
     }
 
     const stream = new H2Stream(promisedId, this.remote.initialWindowSize, "reservedRemote");
+    // A pushed stream is half-closed(local) from the start — the client never
+    // sends a body on it — so its send side counts as done for retirement.
+    stream.localClosed = true;
     this.streams.set(promisedId, stream);
 
     const req: HeadHead = collectRequestHead(requestHeaders);
@@ -347,10 +426,19 @@ export class H2Connection {
     if (this.goawayReceived) throw new H2Error("REFUSED_STREAM", "connection is going away");
     await this.ready;
 
+    // Respect the peer's SETTINGS_MAX_CONCURRENT_STREAMS: park until a slot frees
+    // (§5.1.2). There is no await between the passing check and the synchronous
+    // reservation below, so waking waiters can never over-allocate the limit.
+    while (!this.canOpenStream()) {
+      if (this.closedFlag) throw this.closeError ?? new H2Error("INTERNAL_ERROR", "connection closed");
+      if (this.goawayReceived) throw new H2Error("REFUSED_STREAM", "connection is going away");
+      await new Promise<void>((resolve) => this.streamSlotWaiters.push(resolve));
+    }
+
     const id = this.nextStreamId;
     this.nextStreamId += 2;
     const stream = new H2Stream(id, this.remote.initialWindowSize, "open");
-    this.streams.set(id, stream);
+    this.streams.set(id, stream); // reserves the slot synchronously
 
     const headers = buildRequestHeaders(init);
     const hasBody = !bodyIsEmpty(init.body);
@@ -370,6 +458,7 @@ export class H2Connection {
 
     this.sendHeaders(id, headers, !hasBody);
     stream.state = hasBody ? "open" : "halfClosedLocal";
+    if (!hasBody) stream.localClosed = true; // bodyless HEADERS carried END_STREAM
 
     if (hasBody) {
       this.pumpBody(stream, init.body!).catch((err) => {
@@ -456,8 +545,14 @@ export class H2Connection {
         offset += grant;
       }
     }
+    // The stream may have been reset/torn down while the last chunk uploaded —
+    // only half-close a stream that is still live (mirrors the Rust pump).
+    if (this.closedFlag || stream.sendWindow.isClosed || !this.streams.has(stream.id)) return;
     await this.send({ type: FrameType.DATA, streamId: stream.id, data: EMPTY, endStream: true });
     stream.state = "halfClosedLocal";
+    stream.localClosed = true;
+    // If the peer already sent its END_STREAM, both sides are now done.
+    this.retireIfFullyClosed(stream.id);
   }
 
   private buildResponse(stream: H2Stream, head: HeadHead): H2Response {
@@ -487,14 +582,26 @@ export class H2Connection {
     if (stream) {
       stream.state = "closed";
       this.streams.delete(id);
+      this.wakeStreamSlots();
     }
   }
 
-  private retireStream(id: number): void {
+  /**
+   * Retire a stream only once BOTH directions have ended. A one-sided close —
+   * the peer's END_STREAM while we are still uploading — leaves the stream
+   * half-closed(remote) and IN the map, so its send window and any inbound
+   * WINDOW_UPDATEs keep working until our upload also finishes and sends its
+   * own END_STREAM (RFC 7540 §5.1). Mirrors the Rust `retire_if_fully_closed`;
+   * a prior version deleted the stream on the peer's END_STREAM, which dropped
+   * later WINDOW_UPDATEs and silently hung/truncated a flow-limited upload.
+   */
+  private retireIfFullyClosed(id: number): void {
     const stream = this.streams.get(id);
-    if (!stream) return;
-    stream.state = "closed";
-    this.streams.delete(id);
+    if (stream && stream.localClosed && stream.remoteClosed) {
+      stream.state = "closed";
+      this.streams.delete(id);
+      this.wakeStreamSlots(); // a freed slot may admit a parked request
+    }
   }
 
   /** A connection-level protocol error: GOAWAY then tear down. */
@@ -521,6 +628,7 @@ export class H2Connection {
     this.connSendWindow.close();
     for (const stream of this.streams.values()) stream.fail(err);
     this.streams.clear();
+    this.wakeStreamSlots(); // parked requests wake and throw the close error
     // Fail every in-flight ping with the close error, matching the "already
     // closed" path (and the Rust client) — never resolve a bogus RTT.
     const pingError = this.closeError ?? new H2Error("NO_ERROR", "connection closed");

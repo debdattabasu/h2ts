@@ -45,6 +45,12 @@ export class H2Stream {
   readonly sendWindow: SendWindow;
   state: StreamState;
 
+  /** Our send side has ended (we sent END_STREAM: bodyless HEADERS or the
+   * body pump's terminal DATA). Until then the stream is at most half-closed. */
+  localClosed = false;
+  /** The peer's send side has ended (we received END_STREAM). Likewise. */
+  remoteClosed = false;
+
   /** Bytes of response body still to be flow-accounted by the connection. */
   readonly body: ReadableStream<Uint8Array>;
   private bodyController!: ReadableStreamDefaultController<Uint8Array>;
@@ -82,8 +88,13 @@ export class H2Stream {
 
   receiveHeaders(raw: Header[], endStream: boolean): void {
     if (!this.gotHead) {
+      const head = collectHeaders(raw);
+      // An interim 1xx response (100 Continue, 103 Early Hints) is NOT the final
+      // response (RFC 7540 §8.1): keep waiting for the real head, and don't let a
+      // following HEADERS block be mistaken for trailers.
+      if (head.status >= 100 && head.status < 200) return;
       this.gotHead = true;
-      this.resolveHead(collectHeaders(raw));
+      this.resolveHead(head);
     } else {
       // Second HEADERS block on an open stream = trailers.
       this.trailers = collectHeaders(raw).headers;

@@ -2,7 +2,7 @@
 import { H2Connection } from "./connection.js";
 import type { Transport } from "./transport/transport.js";
 import { openWebSocket, webSocketTransport, type WebSocketLike } from "./transport/websocket.js";
-import type { ConnectOptions } from "./types.js";
+import type { ConnectOptions, H2RequestInit, H2Response } from "./types.js";
 
 /**
  * Create an HTTP/2 client over any byte-duplex {@link Transport}, speaking HTTP/2
@@ -54,4 +54,101 @@ export async function connectWebSocket(
   const connection = connect(webSocketTransport(ws), options);
   connection.protocol = ws.protocol ?? "";
   return connection;
+}
+
+// --- connection pool (Go-style multi-connection parallelism) ---
+
+/** The subset of {@link H2Connection} a pool routes over. */
+export interface PoolConnection {
+  readonly isClosed: boolean;
+  /** True if the connection is under the peer's SETTINGS_MAX_CONCURRENT_STREAMS. */
+  canOpenStream(): boolean;
+  request(init: H2RequestInit): Promise<H2Response>;
+  close(): void;
+}
+
+export interface PoolOptions extends WebSocketConnectOptions {
+  /**
+   * Maximum number of WebSocket connections the pool may open. Default:
+   * unbounded. When reached, further requests park on an existing connection
+   * (which queues internally) instead of opening a new one.
+   */
+  maxConnections?: number;
+}
+
+/**
+ * A pool of HTTP/2-over-WebSocket connections. Each request is routed to a
+ * connection that still has a free stream slot (per the peer's
+ * SETTINGS_MAX_CONCURRENT_STREAMS); when all are saturated a new WebSocket is
+ * opened — the default `golang.org/x/net/http2` behaviour
+ * (`StrictMaxConcurrentStreams = false`). Build one with {@link connectPool}.
+ */
+export class H2Pool {
+  private conns: PoolConnection[] = [];
+  private opening: Promise<void> | undefined;
+
+  constructor(
+    private readonly factory: () => Promise<PoolConnection>,
+    private readonly maxConnections: number = Number.POSITIVE_INFINITY,
+  ) {}
+
+  /** Route a request to a free connection, opening a new one if all are full. */
+  async request(init: H2RequestInit): Promise<H2Response> {
+    for (;;) {
+      this.conns = this.conns.filter((c) => !c.isClosed);
+      const ready = this.conns.find((c) => c.canOpenStream());
+      if (ready) return ready.request(init);
+      if (this.conns.length > 0 && this.conns.length >= this.maxConnections) {
+        // At the connection cap: park on an existing connection, which queues the
+        // request internally until one of its stream slots frees.
+        return this.conns[0]!.request(init);
+      }
+      await this.openOne();
+      const fresh = this.conns[this.conns.length - 1];
+      if (fresh && !fresh.isClosed && !fresh.canOpenStream()) {
+        // A brand-new connection already at its limit (a server advertising a tiny
+        // limit): park on it rather than opening an unbounded number of connections.
+        return fresh.request(init);
+      }
+    }
+  }
+
+  /** Open one connection at a time; concurrent callers share the in-flight open. */
+  private openOne(): Promise<void> {
+    if (!this.opening) {
+      this.opening = this.factory()
+        .then((conn) => {
+          this.conns.push(conn);
+        })
+        .finally(() => {
+          this.opening = undefined;
+        });
+    }
+    return this.opening;
+  }
+
+  /** The number of live connections currently in the pool. */
+  get connections(): number {
+    return this.conns.filter((c) => !c.isClosed).length;
+  }
+
+  /** Gracefully close every connection in the pool. */
+  close(): void {
+    for (const conn of this.conns) conn.close();
+    this.conns = [];
+  }
+}
+
+/**
+ * Open a pool of HTTP/2 clients to `url`, each tunneled over its own WebSocket.
+ * Like {@link connectWebSocket}, but transparently opens additional connections
+ * when concurrent demand exceeds a connection's SETTINGS_MAX_CONCURRENT_STREAMS
+ * — real HTTP/2 multiplexing first, extra connections only when saturated.
+ */
+export function connectPool(url: string, options: PoolOptions = {}): H2Pool {
+  const { maxConnections, ...connectOptions } = options;
+  return new H2Pool(
+    () => connectWebSocket(url, connectOptions),
+    maxConnections ?? Number.POSITIVE_INFINITY,
+  );
 }

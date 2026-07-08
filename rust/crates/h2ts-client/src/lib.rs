@@ -32,6 +32,7 @@ pub mod errors;
 pub mod flow;
 pub mod frames;
 pub mod hpack;
+pub mod pool;
 pub mod transport;
 
 /// The WebSocket subprotocol an h2ts client offers by default (echoed by the
@@ -41,10 +42,11 @@ pub const DEFAULT_SUBPROTOCOL: &str = "h2ts";
 pub use connection::{connect, ConnectOptions, H2Connection, RequestBody, RequestInit, Response};
 pub use errors::{ErrorCode, H2Error};
 pub use hpack::Header;
+pub use pool::{H2Pool, PoolConnection};
 pub use transport::{ByteSink, ByteStream, Transport, TransportError};
 
 // Browser WebSocket transport — wasm32 only, behind the default `web` feature.
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod web;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
-pub use web::{connect_websocket, websocket_transport};
+pub use web::{connect_pool, connect_websocket, websocket_transport};

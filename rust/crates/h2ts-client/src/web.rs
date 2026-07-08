@@ -14,6 +14,8 @@ use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{BinaryType, MessageEvent, WebSocket};
 
 use crate::connection::{connect, ConnectOptions, H2Connection};
+use crate::errors::{ErrorCode, H2Error};
+use crate::pool::{H2Pool, PoolConnection};
 use crate::transport::{ByteSink, ByteStream, Transport, TransportError};
 
 /// Open a WebSocket to `url`, wait for it to connect, and start an HTTP/2 client
@@ -29,6 +31,37 @@ pub async fn connect_websocket(
     let (conn, driver) = connect(transport, options);
     wasm_bindgen_futures::spawn_local(driver);
     Ok(conn)
+}
+
+/// Open a pool of HTTP/2 clients to `url`, each tunneled over its own WebSocket.
+/// Like [`connect_websocket`], but transparently opens additional connections when
+/// concurrent demand exceeds a connection's SETTINGS_MAX_CONCURRENT_STREAMS — real
+/// multiplexing first, extra connections only when saturated (the default
+/// `golang.org/x/net/http2` behaviour). `max_connections` caps how many are opened
+/// (`usize::MAX` for unbounded).
+pub fn connect_pool(
+    url: &str,
+    protocols: &[&str],
+    options: ConnectOptions,
+    max_connections: usize,
+) -> H2Pool {
+    let url = url.to_string();
+    let protocols: Vec<String> = protocols.iter().map(|p| (*p).to_string()).collect();
+    H2Pool::new(
+        move || {
+            let url = url.clone();
+            let protocols = protocols.clone();
+            let options = options.clone();
+            async move {
+                let refs: Vec<&str> = protocols.iter().map(String::as_str).collect();
+                match connect_websocket(&url, &refs, options).await {
+                    Ok(conn) => Ok(Rc::new(conn) as Rc<dyn PoolConnection>),
+                    Err(e) => Err(H2Error::new(ErrorCode::ConnectError, format!("{e:?}"))),
+                }
+            }
+        },
+        max_connections,
+    )
 }
 
 /// Construct a WebSocket and resolve once it's OPEN (or reject on failure).

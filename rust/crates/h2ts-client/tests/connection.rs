@@ -753,6 +753,100 @@ fn finishes_upload_after_an_early_complete_response() {
 }
 
 #[test]
+fn finishes_a_flow_limited_upload_after_an_early_complete_response() {
+    // Regression (flow-limited variant of `finishes_upload_after_an_early_complete_response`):
+    // the server completes its response (END_STREAM) before the upload finishes AND
+    // the body is larger than the flow-control window, so the client must honor a
+    // stream-level WINDOW_UPDATE that arrives AFTER the early response. The stream
+    // must stay routable in the map post-remote-END_STREAM (retire only when BOTH
+    // sides end). Mirrors the TS client's regression test.
+    let mut pool = LocalPool::new();
+    let sp = pool.spawner();
+    let (transport, c2s_rx, s2c_tx) = mock_transport();
+    let (conn, driver) = connect(transport, ConnectOptions::default());
+    sp.spawn_local(driver).unwrap();
+
+    let total = 100_000usize;
+    let body = vec![0x61u8; total];
+    sp.spawn_local(async move {
+        let mut res = conn
+            .request(RequestInit {
+                method: Some("POST".into()),
+                path: Some("/upload".into()),
+                authority: Some("example.com".into()),
+                body: body.into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(res.status, 200);
+        let _ = res.bytes().await;
+    })
+    .unwrap();
+
+    pool.run_until(async move {
+        let mut server = ServerSide::new(c2s_rx);
+        server.read_preface().await;
+        assert!(matches!(server.next_frame().await, Frame::Settings { .. }));
+        assert!(matches!(
+            server.next_frame().await,
+            Frame::Headers { stream_id: 1, .. }
+        ));
+
+        // Drain exactly the initial 65535-byte window, then the client parks.
+        let mut sent = 0usize;
+        while sent < SPEC_INITIAL_WINDOW as usize {
+            let (d, end) = server.next_data().await;
+            assert!(!end);
+            sent += d.len();
+        }
+        assert_eq!(sent, SPEC_INITIAL_WINDOW as usize);
+
+        // COMPLETE response now (headers-only, END_STREAM) — while still uploading.
+        s2c_tx
+            .unbounded_send(serialize_frame(&Frame::Settings {
+                ack: false,
+                settings: Settings::default(),
+            }))
+            .unwrap();
+        let block = HpackEncoder::new().encode(&[Header::new(":status", "200")]);
+        s2c_tx
+            .unbounded_send(serialize_frame(&Frame::Headers {
+                stream_id: 1,
+                header_block_fragment: block,
+                end_stream: true,
+                end_headers: true,
+                priority: None,
+            }))
+            .unwrap();
+
+        // Grant more window so the client can finish uploading.
+        s2c_tx
+            .unbounded_send(serialize_frame(&Frame::WindowUpdate {
+                stream_id: 0,
+                window_size_increment: 1_000_000,
+            }))
+            .unwrap();
+        s2c_tx
+            .unbounded_send(serialize_frame(&Frame::WindowUpdate {
+                stream_id: 1,
+                window_size_increment: 1_000_000,
+            }))
+            .unwrap();
+
+        // The client must upload the remainder and send its own END_STREAM.
+        loop {
+            let (d, end) = server.next_data().await;
+            sent += d.len();
+            if end {
+                break;
+            }
+        }
+        assert_eq!(sent, total, "client dropped its body after the early response");
+    });
+}
+
+#[test]
 fn ping_errors_when_the_connection_closes_in_flight() {
     // An in-flight PING whose connection tears down before the ACK arrives must
     // resolve with an *error* — not hang, and not report a bogus round-trip time.
@@ -1304,6 +1398,320 @@ fn reassembles_a_header_block_split_across_continuation() {
         };
 
         futures::join!(client, server);
+    });
+}
+
+#[test]
+fn honors_the_peers_max_concurrent_streams() {
+    // The peer advertises SETTINGS_MAX_CONCURRENT_STREAMS=1: while one stream is
+    // open the client must PARK a second request (not open stream 3), then release
+    // it once the first stream completes (§5.1.2).
+    let mut pool = LocalPool::new();
+    let sp = pool.spawner();
+    let (transport, c2s_rx, s2c_tx) = mock_transport();
+    let (conn, driver) = connect(transport, ConnectOptions::default());
+    sp.spawn_local(driver).unwrap();
+
+    // req1: kept open until the server ends it.
+    let conn1 = conn.clone();
+    sp.spawn_local(async move {
+        let mut res = conn1
+            .request(RequestInit {
+                path: Some("/a".into()),
+                authority: Some("e".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let _ = res.bytes().await;
+    })
+    .unwrap();
+
+    // req2: fired only once the gate opens (after the client has applied max=1).
+    let (gate_tx, gate_rx) = oneshot::channel::<()>();
+    let (done_tx, done_rx) = oneshot::channel::<u16>();
+    let conn2 = conn.clone();
+    sp.spawn_local(async move {
+        let _ = gate_rx.await;
+        let mut res = conn2
+            .request(RequestInit {
+                path: Some("/b".into()),
+                authority: Some("e".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let _ = res.bytes().await;
+        let _ = done_tx.send(res.status);
+    })
+    .unwrap();
+
+    pool.run_until(async move {
+        let mut server = ServerSide::new(c2s_rx);
+        server.read_preface().await;
+        assert!(matches!(server.next_frame().await, Frame::Settings { .. }));
+        assert!(matches!(
+            server.next_frame().await,
+            Frame::Headers { stream_id: 1, .. }
+        ));
+        // Advertise a limit of 1.
+        s2c_tx
+            .unbounded_send(serialize_frame(&Frame::Settings {
+                ack: false,
+                settings: Settings {
+                    max_concurrent_streams: Some(1),
+                    ..Default::default()
+                },
+            }))
+            .unwrap();
+        // The client's SETTINGS ack means it has applied the limit.
+        assert!(matches!(
+            server.next_frame().await,
+            Frame::Settings { ack: true, .. }
+        ));
+
+        // Release req2: it must PARK — stream 1 is open, so we're at the limit.
+        gate_tx.send(()).unwrap();
+        quiesce().await;
+        assert!(
+            server.try_next_frame().is_none(),
+            "client opened a second stream past the peer's limit"
+        );
+
+        // Complete stream 1 → frees the slot → req2 proceeds.
+        let head = HpackEncoder::new().encode(&[Header::new(":status", "200")]);
+        s2c_tx
+            .unbounded_send(serialize_frame(&Frame::Headers {
+                stream_id: 1,
+                header_block_fragment: head,
+                end_stream: false,
+                end_headers: true,
+                priority: None,
+            }))
+            .unwrap();
+        s2c_tx
+            .unbounded_send(serialize_frame(&Frame::Data {
+                stream_id: 1,
+                data: b"a".to_vec(),
+                end_stream: true,
+            }))
+            .unwrap();
+
+        // The parked request now opens stream 3 (skipping any WINDOW_UPDATE).
+        loop {
+            match server.next_frame().await {
+                Frame::Headers { stream_id: 3, .. } => break,
+                Frame::WindowUpdate { .. } => continue,
+                _ => panic!("expected stream 3 HEADERS after the slot freed"),
+            }
+        }
+        let head3 = HpackEncoder::new().encode(&[Header::new(":status", "200")]);
+        s2c_tx
+            .unbounded_send(serialize_frame(&Frame::Headers {
+                stream_id: 3,
+                header_block_fragment: head3,
+                end_stream: false,
+                end_headers: true,
+                priority: None,
+            }))
+            .unwrap();
+        s2c_tx
+            .unbounded_send(serialize_frame(&Frame::Data {
+                stream_id: 3,
+                data: b"b".to_vec(),
+                end_stream: true,
+            }))
+            .unwrap();
+
+        assert_eq!(done_rx.await.unwrap(), 200);
+    });
+}
+
+#[test]
+fn treats_a_1xx_interim_response_as_non_final() {
+    // An interim 1xx (103 Early Hints) before the final response must NOT be
+    // surfaced as the response, nor should the real response be filed as trailers.
+    let mut pool = LocalPool::new();
+    let sp = pool.spawner();
+    let (transport, c2s_rx, s2c_tx) = mock_transport();
+    let (conn, driver) = connect(transport, ConnectOptions::default());
+    sp.spawn_local(driver).unwrap();
+
+    pool.run_until(async move {
+        let client = async move {
+            let mut res = conn
+                .request(RequestInit {
+                    path: Some("/x".into()),
+                    authority: Some("example.com".into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(res.status, 200);
+            assert_eq!(res.bytes().await.unwrap(), b"body");
+            assert!(res.trailers().is_none());
+        };
+
+        let server = async move {
+            let mut server = ServerSide::new(c2s_rx);
+            server.read_preface().await;
+            assert!(matches!(server.next_frame().await, Frame::Settings { .. }));
+            assert!(matches!(
+                server.next_frame().await,
+                Frame::Headers { stream_id: 1, .. }
+            ));
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Settings {
+                    ack: false,
+                    settings: Settings::default(),
+                }))
+                .unwrap();
+            // Interim 103 Early Hints (no END_STREAM).
+            let early = HpackEncoder::new()
+                .encode(&[Header::new(":status", "103"), Header::new("link", "</a.css>")]);
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Headers {
+                    stream_id: 1,
+                    header_block_fragment: early,
+                    end_stream: false,
+                    end_headers: true,
+                    priority: None,
+                }))
+                .unwrap();
+            // Real final response.
+            let head = HpackEncoder::new().encode(&[Header::new(":status", "200")]);
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Headers {
+                    stream_id: 1,
+                    header_block_fragment: head,
+                    end_stream: false,
+                    end_headers: true,
+                    priority: None,
+                }))
+                .unwrap();
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Data {
+                    stream_id: 1,
+                    data: b"body".to_vec(),
+                    end_stream: true,
+                }))
+                .unwrap();
+        };
+
+        futures::join!(client, server);
+    });
+}
+
+#[test]
+fn out_of_range_max_frame_size_tears_down_with_goaway() {
+    // A peer SETTINGS_MAX_FRAME_SIZE below the 16384 floor is a PROTOCOL_ERROR
+    // (§6.5.2): the client emits GOAWAY and closes.
+    let mut pool = LocalPool::new();
+    let sp = pool.spawner();
+    let (transport, c2s_rx, s2c_tx) = mock_transport();
+    let (conn, driver) = connect(transport, ConnectOptions::default());
+    sp.spawn_local(driver).unwrap();
+
+    pool.run_until(async move {
+        let conn_probe = conn.clone();
+        let client = async move {
+            let res = conn
+                .request(RequestInit {
+                    path: Some("/x".into()),
+                    authority: Some("example.com".into()),
+                    ..Default::default()
+                })
+                .await;
+            assert!(res.is_err(), "request should error on an invalid SETTINGS");
+        };
+
+        let server = async move {
+            let mut server = ServerSide::new(c2s_rx);
+            server.read_preface().await;
+            assert!(matches!(server.next_frame().await, Frame::Settings { .. }));
+            assert!(matches!(
+                server.next_frame().await,
+                Frame::Headers { stream_id: 1, .. }
+            ));
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Settings {
+                    ack: false,
+                    settings: Settings {
+                        max_frame_size: Some(100),
+                        ..Default::default()
+                    },
+                }))
+                .unwrap();
+            while !matches!(server.next_frame().await, Frame::Goaway { .. }) {}
+        };
+
+        futures::join!(client, server);
+        assert!(conn_probe.is_closed(), "connection should be closed");
+    });
+}
+
+#[test]
+fn a_header_block_over_the_cap_tears_down_with_goaway() {
+    // An endless CONTINUATION stream must be bounded: once the accumulated block
+    // exceeds the cap, the client emits GOAWAY and closes rather than buffering.
+    let mut pool = LocalPool::new();
+    let sp = pool.spawner();
+    let (transport, c2s_rx, s2c_tx) = mock_transport();
+    let (conn, driver) = connect(transport, ConnectOptions::default());
+    sp.spawn_local(driver).unwrap();
+
+    pool.run_until(async move {
+        let conn_probe = conn.clone();
+        let client = async move {
+            let res = conn
+                .request(RequestInit {
+                    path: Some("/x".into()),
+                    authority: Some("example.com".into()),
+                    ..Default::default()
+                })
+                .await;
+            assert!(res.is_err(), "request should error on a header-block flood");
+        };
+
+        let server = async move {
+            let mut server = ServerSide::new(c2s_rx);
+            server.read_preface().await;
+            assert!(matches!(server.next_frame().await, Frame::Settings { .. }));
+            assert!(matches!(
+                server.next_frame().await,
+                Frame::Headers { stream_id: 1, .. }
+            ));
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Settings {
+                    ack: false,
+                    settings: Settings::default(),
+                }))
+                .unwrap();
+            // HEADERS (no END_HEADERS) then CONTINUATION frames past the 1 MiB cap.
+            let frag = vec![0u8; 16000];
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Headers {
+                    stream_id: 1,
+                    header_block_fragment: frag.clone(),
+                    end_stream: false,
+                    end_headers: false,
+                    priority: None,
+                }))
+                .unwrap();
+            for _ in 0..70 {
+                s2c_tx
+                    .unbounded_send(serialize_frame(&Frame::Continuation {
+                        stream_id: 1,
+                        header_block_fragment: frag.clone(),
+                        end_headers: false,
+                    }))
+                    .unwrap();
+            }
+            while !matches!(server.next_frame().await, Frame::Goaway { .. }) {}
+        };
+
+        futures::join!(client, server);
+        assert!(conn_probe.is_closed(), "connection should be closed");
     });
 }
 

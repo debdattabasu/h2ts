@@ -90,6 +90,213 @@ class FrameReader {
   }
 }
 
+describe("receive path: early complete response vs in-flight upload", () => {
+  it("finishes a flow-limited upload after an early complete response", async () => {
+    // Regression: the server completes its response (END_STREAM) before the
+    // upload finishes, AND the body is larger than the flow-control window — so
+    // the client must honor a stream-level WINDOW_UPDATE that arrives AFTER the
+    // early response. A prior bug retired the stream on the peer's END_STREAM,
+    // dropping that WINDOW_UPDATE and hanging the pump (silent upload truncation).
+    // Mirrors the Rust client's flow-limited early-complete test.
+    const { transport, clientReader, serverWriter } = mockTransport();
+    const conn = connect(transport);
+    const frames = new FrameReader(clientReader);
+
+    const total = 100_000; // > the default 65535 send window: the pump WILL park
+    const body = new Uint8Array(total);
+    const reqP = conn.request({ method: "POST", path: "/upload", authority: "e", body });
+    reqP.catch(() => {});
+
+    await frames.until((f) => f.type === FrameType.HEADERS);
+
+    // Drain exactly the initial 65535-byte window (conn + stream both start there).
+    let sent = 0;
+    while (sent < 65535) {
+      const d = await frames.nextData();
+      expect(d.endStream).toBe(false);
+      sent += d.data.length;
+    }
+    expect(sent).toBe(65535);
+
+    // A COMPLETE response NOW (headers-only, END_STREAM) — while still uploading.
+    const head = new HpackEncoder().encode([{ name: ":status", value: "200" }]);
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.HEADERS, streamId: 1, headerBlockFragment: head, endStream: true, endHeaders: true }),
+    );
+
+    // The caller sees a clean 200 while the send side is still open.
+    const res = await reqP;
+    expect(res.status).toBe(200);
+
+    // The server keeps the request side open and grants more window (a well-behaved
+    // origin draining the body) so the client can finish uploading.
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.WINDOW_UPDATE, streamId: 0, windowSizeIncrement: 1_000_000 }),
+    );
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.WINDOW_UPDATE, streamId: 1, windowSizeIncrement: 1_000_000 }),
+    );
+
+    // The client must upload the remainder and send its own END_STREAM.
+    for (;;) {
+      const d = await frames.nextData();
+      sent += d.data.length;
+      if (d.endStream) break;
+    }
+    expect(sent).toBe(total);
+  }, 8000);
+});
+
+describe("receive path: interim responses, settings validation, header cap", () => {
+  it("treats a 1xx interim response as non-final and keeps the real response", async () => {
+    const { transport, clientReader, serverWriter } = mockTransport();
+    const conn = connect(transport);
+    const frames = new FrameReader(clientReader);
+
+    const reqP = conn.request({ path: "/x", authority: "e" });
+    await frames.until((f) => f.type === FrameType.HEADERS);
+    void frames.drain();
+
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.SETTINGS, streamId: 0, ack: false, settings: {} }),
+    );
+    // Interim 103 Early Hints (no END_STREAM) — must NOT be surfaced as the response.
+    const early = new HpackEncoder().encode([
+      { name: ":status", value: "103" },
+      { name: "link", value: "</a.css>; rel=preload" },
+    ]);
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.HEADERS, streamId: 1, headerBlockFragment: early, endStream: false, endHeaders: true }),
+    );
+    // The real final response follows.
+    const final = new HpackEncoder().encode([{ name: ":status", value: "200" }]);
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.HEADERS, streamId: 1, headerBlockFragment: final, endStream: false, endHeaders: true }),
+    );
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.DATA, streamId: 1, data: encodeUtf8("body"), endStream: true }),
+    );
+
+    const res = await reqP;
+    expect(res.status).toBe(200); // the 103 was not mistaken for the final response
+    expect(decodeUtf8(await res.bytes())).toBe("body");
+    expect(res.trailers()).toBeUndefined(); // ...nor was the real response filed as trailers
+  }, 8000);
+
+  it("tears down with a GOAWAY on an out-of-range SETTINGS_MAX_FRAME_SIZE", async () => {
+    const { transport, clientReader, serverWriter } = mockTransport();
+    const conn = connect(transport);
+    const frames = new FrameReader(clientReader);
+
+    const reqP = conn.request({ path: "/x", authority: "e" });
+    reqP.catch(() => {});
+    await frames.until((f) => f.type === FrameType.HEADERS);
+
+    // maxFrameSize below the 16384 floor is a PROTOCOL_ERROR (§6.5.2).
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.SETTINGS, streamId: 0, ack: false, settings: { maxFrameSize: 100 } }),
+    );
+
+    const goaway = await frames.until((f) => f.type === FrameType.GOAWAY);
+    expect(goaway.type).toBe(FrameType.GOAWAY);
+    await expect(reqP).rejects.toThrow();
+    expect(conn.isClosed).toBe(true);
+  }, 8000);
+
+  it("tears down when a header block exceeds the size cap (CONTINUATION flood)", async () => {
+    const { transport, clientReader, serverWriter } = mockTransport();
+    const conn = connect(transport);
+    const frames = new FrameReader(clientReader);
+
+    const reqP = conn.request({ path: "/x", authority: "e" });
+    reqP.catch(() => {});
+    await frames.until((f) => f.type === FrameType.HEADERS);
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.SETTINGS, streamId: 0, ack: false, settings: {} }),
+    );
+
+    // HEADERS (no END_HEADERS) then CONTINUATION frames whose total exceeds the
+    // 1 MiB cap — the client must bail rather than buffer unboundedly.
+    const frag = new Uint8Array(16000);
+    void serverWriter
+      .write(serializeFrame({ type: FrameType.HEADERS, streamId: 1, headerBlockFragment: frag, endStream: false, endHeaders: false }))
+      .catch(() => {});
+    for (let i = 0; i < 70; i++) {
+      void serverWriter
+        .write(serializeFrame({ type: FrameType.CONTINUATION, streamId: 1, headerBlockFragment: frag, endHeaders: false }))
+        .catch(() => {});
+    }
+
+    const goaway = await frames.until((f) => f.type === FrameType.GOAWAY);
+    expect(goaway.type).toBe(FrameType.GOAWAY);
+    await expect(reqP).rejects.toThrow();
+    expect(conn.isClosed).toBe(true);
+  }, 8000);
+});
+
+describe("receive path: max concurrent streams", () => {
+  it("honors the peer's SETTINGS_MAX_CONCURRENT_STREAMS", async () => {
+    const { transport, clientReader, serverWriter } = mockTransport();
+    const conn = connect(transport);
+    const frames = new FrameReader(clientReader);
+
+    // req1 (bodyless): its stream stays open until we complete it below.
+    const r1 = conn.request({ path: "/a", authority: "e" });
+    r1.catch(() => {});
+    await frames.until((f) => f.type === FrameType.HEADERS && f.streamId === 1);
+
+    // Advertise a limit of 1; the client's SETTINGS ack means it has applied it.
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.SETTINGS, streamId: 0, ack: false, settings: { maxConcurrentStreams: 1 } }),
+    );
+    await frames.until((f) => f.type === FrameType.SETTINGS && f.ack === true);
+
+    // Record every subsequent outbound frame so we can watch for a stream opening.
+    const seen: Frame[] = [];
+    void (async () => {
+      try {
+        for (;;) seen.push(await frames.next());
+      } catch {
+        /* connection closed */
+      }
+    })();
+    const tick = () => new Promise((r) => setTimeout(r, 15));
+    const openedStream3 = () => seen.some((f) => f.type === FrameType.HEADERS && f.streamId === 3);
+
+    // req2 must PARK — stream 1 is open, so we're at the limit of 1.
+    const r2 = conn.request({ path: "/b", authority: "e" });
+    r2.catch(() => {});
+    await tick();
+    expect(openedStream3()).toBe(false); // parked: no second stream opened
+
+    // Complete stream 1 → frees the slot.
+    const head1 = new HpackEncoder().encode([{ name: ":status", value: "200" }]);
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.HEADERS, streamId: 1, headerBlockFragment: head1, endStream: false, endHeaders: true }),
+    );
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.DATA, streamId: 1, data: encodeUtf8("a"), endStream: true }),
+    );
+
+    // The parked request now opens stream 3.
+    const start = Date.now();
+    while (!openedStream3()) {
+      if (Date.now() - start > 2000) throw new Error("parked request never opened stream 3");
+      await tick();
+    }
+
+    const head3 = new HpackEncoder().encode([{ name: ":status", value: "200" }]);
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.HEADERS, streamId: 3, headerBlockFragment: head3, endStream: false, endHeaders: true }),
+    );
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.DATA, streamId: 3, data: encodeUtf8("b"), endStream: true }),
+    );
+    const res2 = await r2;
+    expect(res2.status).toBe(200);
+  }, 8000);
+});
+
 describe("receive path: RST_STREAM", () => {
   it("mid-upload rejects the request without hanging", async () => {
     const { transport, clientReader, serverWriter } = mockTransport();

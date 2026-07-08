@@ -31,6 +31,9 @@ use crate::transport::Transport;
 
 const CONNECTION_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const SPEC_INITIAL_WINDOW: i64 = 65535;
+/// Cap on the accumulated header block (HEADERS + CONTINUATION) so an endless
+/// CONTINUATION stream can't exhaust memory (RFC 9113 §10.5.1 / CVE-2024-27316).
+const MAX_HEADER_BLOCK_SIZE: usize = 1 << 20; // 1 MiB — far above any real block
 const FORBIDDEN_HEADERS: [&str; 6] = [
     "connection",
     "host",
@@ -152,7 +155,7 @@ impl Response {
 }
 
 /// Settings we advertise + push handling (port of `ConnectOptions`).
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ConnectOptions {
     pub header_table_size: Option<usize>,
     pub enable_push: Option<bool>,
@@ -232,9 +235,16 @@ impl StreamState {
 
     fn receive_headers(&mut self, raw: Vec<Header>, end_stream: bool) {
         if !self.got_head {
+            let head = collect_headers(raw);
+            // An interim 1xx response (100 Continue, 103 Early Hints) is NOT the
+            // final response (RFC 7540 §8.1): keep waiting for the real head, and
+            // don't let a following HEADERS block be mistaken for trailers.
+            if (100..200).contains(&head.status) {
+                return;
+            }
             self.got_head = true;
             if let Some(tx) = self.head_tx.take() {
-                let _ = tx.send(Ok(collect_headers(raw)));
+                let _ = tx.send(Ok(head));
             }
         } else {
             // A second HEADERS block on an open stream = trailers.
@@ -301,6 +311,9 @@ struct RemoteSettings {
     header_table_size: usize,
     #[allow(dead_code)]
     enable_push: bool,
+    /// Peer's SETTINGS_MAX_CONCURRENT_STREAMS — the cap on our open streams
+    /// (§5.1.2). `u32::MAX` (effectively unlimited) until the peer advertises one.
+    max_concurrent_streams: u32,
 }
 
 impl Default for RemoteSettings {
@@ -310,6 +323,7 @@ impl Default for RemoteSettings {
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             header_table_size: 4096,
             enable_push: true,
+            max_concurrent_streams: u32::MAX,
         }
     }
 }
@@ -325,6 +339,8 @@ struct PendingHeaderBlock {
     end_stream: bool,
     promised_stream_id: Option<u32>,
     fragments: Vec<Vec<u8>>,
+    /// Running total of fragment bytes, checked against MAX_HEADER_BLOCK_SIZE.
+    size: usize,
 }
 
 /// An in-flight PING awaiting its ACK, with the send time so the round-trip time
@@ -353,6 +369,8 @@ struct ConnState {
     pending_header_block: Option<PendingHeaderBlock>,
     pings: HashMap<[u8; 8], PingWaiter>,
     ping_counter: u32,
+    /// Requests parked waiting for a concurrent-stream slot to free up (§5.1.2).
+    slot_waiters: Vec<oneshot::Sender<()>>,
     closed: bool,
     close_error: Option<H2Error>,
     goaway_received: bool,
@@ -402,7 +420,7 @@ impl ConnState {
                 if ack {
                     return Ok(());
                 }
-                self.apply_remote_settings(&settings);
+                self.apply_remote_settings(&settings)?;
                 self.send_frame(Frame::Settings {
                     ack: true,
                     settings: Settings::default(),
@@ -415,13 +433,16 @@ impl ConnState {
                 end_headers,
                 ..
             } => {
+                let size = header_block_fragment.len();
                 self.pending_header_block = Some(PendingHeaderBlock {
                     stream_id,
                     kind: HeaderBlockKind::Response,
                     end_stream,
                     promised_stream_id: None,
                     fragments: vec![header_block_fragment],
+                    size,
                 });
+                self.guard_header_block_size()?;
                 if end_headers {
                     self.complete_header_block()?;
                 }
@@ -433,7 +454,8 @@ impl ConnState {
             } => {
                 match &mut self.pending_header_block {
                     Some(pb) if pb.stream_id == stream_id => {
-                        pb.fragments.push(header_block_fragment)
+                        pb.size += header_block_fragment.len();
+                        pb.fragments.push(header_block_fragment);
                     }
                     _ => {
                         return Err(H2Error::new(
@@ -442,6 +464,7 @@ impl ConnState {
                         ))
                     }
                 }
+                self.guard_header_block_size()?;
                 if end_headers {
                     self.complete_header_block()?;
                 }
@@ -452,13 +475,16 @@ impl ConnState {
                 header_block_fragment,
                 end_headers,
             } => {
+                let size = header_block_fragment.len();
                 self.pending_header_block = Some(PendingHeaderBlock {
                     stream_id,
                     kind: HeaderBlockKind::Push,
                     end_stream: false,
                     promised_stream_id: Some(promised_stream_id),
                     fragments: vec![header_block_fragment],
+                    size,
                 });
+                self.guard_header_block_size()?;
                 if end_headers {
                     self.complete_header_block()?;
                 }
@@ -553,11 +579,26 @@ impl ConnState {
                         s.fail(err.clone());
                     }
                 }
+                self.wake_slot_waiters(); // parked requests now reject (going away)
                 if error_code != 0 {
                     self.destroy(err);
                 }
             }
             Frame::Priority { .. } => {} // prioritization not implemented
+        }
+        Ok(())
+    }
+
+    /// Bound the accumulated header block so an endless CONTINUATION stream can't
+    /// exhaust memory (RFC 9113 §10.5.1 / CVE-2024-27316).
+    fn guard_header_block_size(&self) -> Result<(), H2Error> {
+        if let Some(pb) = &self.pending_header_block {
+            if pb.size > MAX_HEADER_BLOCK_SIZE {
+                return Err(H2Error::new(
+                    ErrorCode::EnhanceYourCalm,
+                    "header block exceeds the maximum size",
+                ));
+            }
         }
         Ok(())
     }
@@ -601,8 +642,15 @@ impl ConnState {
         Ok(())
     }
 
-    fn apply_remote_settings(&mut self, s: &Settings) {
+    fn apply_remote_settings(&mut self, s: &Settings) -> Result<(), H2Error> {
         if let Some(iw) = s.initial_window_size {
+            // §6.5.2: a window above 2^31-1 is a FLOW_CONTROL_ERROR.
+            if iw > 0x7fff_ffff {
+                return Err(H2Error::new(
+                    ErrorCode::FlowControlError,
+                    "SETTINGS_INITIAL_WINDOW_SIZE exceeds 2^31-1",
+                ));
+            }
             let delta = iw as i64 - self.remote.initial_window_size;
             self.remote.initial_window_size = iw as i64;
             for stream in self.streams.values_mut() {
@@ -610,6 +658,13 @@ impl ConnState {
             }
         }
         if let Some(mfs) = s.max_frame_size {
+            // §6.5.2: MAX_FRAME_SIZE must be within 2^14..2^24-1.
+            if !(16384..=16_777_215).contains(&mfs) {
+                return Err(H2Error::new(
+                    ErrorCode::ProtocolError,
+                    "SETTINGS_MAX_FRAME_SIZE out of range",
+                ));
+            }
             self.remote.max_frame_size = mfs as usize;
         }
         if let Some(hts) = s.header_table_size {
@@ -618,6 +673,11 @@ impl ConnState {
         if let Some(ep) = s.enable_push {
             self.remote.enable_push = ep;
         }
+        if let Some(mcs) = s.max_concurrent_streams {
+            self.remote.max_concurrent_streams = mcs;
+            self.wake_slot_waiters(); // a raised limit may free parked requests
+        }
+        Ok(())
     }
 
     fn send_headers(&self, id: u32, block: Vec<u8>, end_stream: bool) {
@@ -658,6 +718,7 @@ impl ConnState {
             error_code: code.value(),
         });
         self.streams.remove(&id);
+        self.wake_slot_waiters();
     }
 
     /// Drop a stream only once BOTH directions have ended. A one-sided close
@@ -671,6 +732,27 @@ impl ConnState {
             .is_some_and(|s| s.local_closed && s.remote_closed);
         if fully_closed {
             self.streams.remove(&id);
+            self.wake_slot_waiters(); // a freed slot may admit a parked request
+        }
+    }
+
+    // --- concurrent-stream limiting (§5.1.2) ---
+
+    /// Client-initiated (odd-id) streams currently open or half-closed — the ones
+    /// that count toward the peer's SETTINGS_MAX_CONCURRENT_STREAMS.
+    fn active_streams(&self) -> usize {
+        self.streams.keys().filter(|id| *id % 2 == 1).count()
+    }
+
+    /// True if opening another request stream would stay within the peer's limit.
+    fn can_open_stream(&self) -> bool {
+        self.active_streams() < self.remote.max_concurrent_streams as usize
+    }
+
+    /// Wake every parked request so it re-checks for a free slot (or a teardown).
+    fn wake_slot_waiters(&mut self) {
+        for tx in self.slot_waiters.drain(..) {
+            let _ = tx.send(());
         }
     }
 
@@ -700,6 +782,7 @@ impl ConnState {
         for (_, w) in self.pings.drain() {
             let _ = w.resolve.send(Err(err.clone()));
         }
+        self.wake_slot_waiters(); // parked requests wake and see the closed state
         // Drop the outbound sender: the write loop drains whatever is still queued
         // (a GOAWAY from `connection_error`/`close`, say) and then ends.
         self.out_tx = None;
@@ -718,12 +801,59 @@ impl H2Connection {
         self.shared.borrow().closed
     }
 
+    /// Client-initiated streams currently open or half-closed — the ones that
+    /// count toward the peer's SETTINGS_MAX_CONCURRENT_STREAMS (§5.1.2).
+    pub fn active_streams(&self) -> usize {
+        self.shared.borrow().active_streams()
+    }
+
+    /// True if a new request would stay within the peer's advertised
+    /// SETTINGS_MAX_CONCURRENT_STREAMS. A connection pool uses this to decide
+    /// whether to route here or open a fresh connection; a direct caller need not
+    /// check — [`request`](Self::request) parks until a slot frees.
+    pub fn can_open_stream(&self) -> bool {
+        self.shared.borrow().can_open_stream()
+    }
+
     /// The negotiated WebSocket subprotocol, if opened via a WebSocket (set by
     /// the caller). Empty otherwise.
     // (Kept minimal here; `connect_websocket` sets it in the web layer.)
     pub async fn request(&self, mut init: RequestInit) -> Result<Response, H2Error> {
         let body = std::mem::take(&mut init.body);
         let has_body = !body.is_empty();
+
+        // Respect the peer's SETTINGS_MAX_CONCURRENT_STREAMS: park until a slot
+        // frees (§5.1.2). There is no await between the passing check and the
+        // synchronous reservation below, so woken waiters can't over-allocate.
+        loop {
+            let rx = {
+                let mut st = self.shared.borrow_mut();
+                if st.closed {
+                    return Err(st.close_error.clone().unwrap_or_else(|| {
+                        H2Error::new(ErrorCode::InternalError, "connection closed")
+                    }));
+                }
+                if st.goaway_received {
+                    return Err(H2Error::new(
+                        ErrorCode::RefusedStream,
+                        "connection is going away",
+                    ));
+                }
+                if st.can_open_stream() {
+                    None
+                } else {
+                    let (tx, rx) = oneshot::channel();
+                    st.slot_waiters.push(tx);
+                    Some(rx)
+                }
+            };
+            match rx {
+                None => break,
+                Some(rx) => {
+                    let _ = rx.await;
+                }
+            }
+        }
 
         let id;
         let head_rx;
@@ -1028,6 +1158,7 @@ pub fn connect(
         pending_header_block: None,
         pings: HashMap::new(),
         ping_counter: 0,
+        slot_waiters: Vec::new(),
         closed: false,
         close_error: None,
         goaway_received: false,

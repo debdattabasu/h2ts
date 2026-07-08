@@ -4,8 +4,12 @@
 export {
   connect,
   connectWebSocket,
+  connectPool,
+  H2Pool,
   DEFAULT_SUBPROTOCOL,
   type WebSocketConnectOptions,
+  type PoolConnection,
+  type PoolOptions,
 } from "./client.js";
 export { webSocketTransport, openWebSocket, type WebSocketLike } from "./transport/websocket.js";
 export type { Transport } from "./transport/transport.js";
