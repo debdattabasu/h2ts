@@ -39,7 +39,9 @@ pub mod transport;
 /// gateway). Offer it first; see `spec/protocol.md`.
 pub const DEFAULT_SUBPROTOCOL: &str = "h2ts";
 
-pub use connection::{connect, ConnectOptions, H2Connection, RequestBody, RequestInit, Response};
+pub use connection::{
+    connect, ConnectOptions, H2Connection, RequestBody, RequestInit, Response, ResponseBody,
+};
 pub use errors::{ErrorCode, H2Error};
 pub use hpack::Header;
 pub use pool::{H2Pool, PoolConnection};

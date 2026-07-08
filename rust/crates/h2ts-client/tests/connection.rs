@@ -43,10 +43,20 @@ async fn read_startup(c2s_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>, want: usize
     }
     assert_eq!(&buf[..CONNECTION_PREFACE.len()], CONNECTION_PREFACE);
     let mut dec = FrameDecoder::default();
-    let mut frames = dec.push(&buf[CONNECTION_PREFACE.len()..]).unwrap();
+    // Skip the startup connection-window growth WINDOW_UPDATE(0) so opening-flight
+    // assertions (SETTINGS then HEADERS) stay position-stable.
+    let keep = |raw: Vec<Frame>, frames: &mut Vec<Frame>| {
+        for f in raw {
+            if !matches!(f, Frame::WindowUpdate { stream_id: 0, .. }) {
+                frames.push(f);
+            }
+        }
+    };
+    let mut frames: Vec<Frame> = Vec::new();
+    keep(dec.push(&buf[CONNECTION_PREFACE.len()..]).unwrap(), &mut frames);
     while frames.len() < want {
         let chunk = c2s_rx.next().await.expect("client closed before frames");
-        frames.extend(dec.push(&chunk).unwrap());
+        keep(dec.push(&chunk).unwrap(), &mut frames);
     }
     frames
 }
@@ -57,6 +67,9 @@ struct ServerSide {
     rx: mpsc::UnboundedReceiver<Vec<u8>>,
     dec: FrameDecoder,
     queue: std::collections::VecDeque<Frame>,
+    /// Skip the one startup connection-window growth WINDOW_UPDATE(0) so tests see
+    /// the [SETTINGS, HEADERS, …] flight they expect; later WINDOW_UPDATEs pass.
+    skip_conn_wu: bool,
 }
 
 impl ServerSide {
@@ -65,7 +78,21 @@ impl ServerSide {
             rx,
             dec: FrameDecoder::default(),
             queue: std::collections::VecDeque::new(),
+            skip_conn_wu: true,
         }
+    }
+
+    /// Pop the next queued frame, transparently dropping the startup
+    /// connection-window WINDOW_UPDATE(0) the first time it appears.
+    fn take_queued(&mut self) -> Option<Frame> {
+        while let Some(f) = self.queue.pop_front() {
+            if self.skip_conn_wu && matches!(f, Frame::WindowUpdate { stream_id: 0, .. }) {
+                self.skip_conn_wu = false;
+                continue;
+            }
+            return Some(f);
+        }
+        None
     }
 
     /// Consume and verify the 24-byte connection preface.
@@ -83,7 +110,7 @@ impl ServerSide {
     /// The next frame the client sends, awaiting more bytes if needed.
     async fn next_frame(&mut self) -> Frame {
         loop {
-            if let Some(f) = self.queue.pop_front() {
+            if let Some(f) = self.take_queued() {
                 return f;
             }
             let chunk = self.rx.next().await.expect("client closed unexpectedly");
@@ -118,7 +145,7 @@ impl ServerSide {
                 self.queue.push_back(f);
             }
         }
-        self.queue.pop_front()
+        self.take_queued()
     }
 }
 
@@ -1524,6 +1551,111 @@ fn honors_the_peers_max_concurrent_streams() {
             .unwrap();
 
         assert_eq!(done_rx.await.unwrap(), 200);
+    });
+}
+
+#[test]
+fn replenishes_the_receive_window_only_on_consumption() {
+    // Consumption-driven flow control (à la node:http2): the client does NOT send a
+    // WINDOW_UPDATE when DATA is buffered — only when the application *reads* it.
+    let mut pool = LocalPool::new();
+    let sp = pool.spawner();
+    let (transport, c2s_rx, s2c_tx) = mock_transport();
+    let (conn, driver) = connect(transport, ConnectOptions::default());
+    sp.spawn_local(driver).unwrap();
+
+    let (gate_tx, gate_rx) = oneshot::channel::<()>();
+    let (done_tx, done_rx) = oneshot::channel::<Vec<u8>>();
+
+    sp.spawn_local(async move {
+        let res = conn
+            .request(RequestInit {
+                path: Some("/download".into()),
+                authority: Some("e".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(res.status, 200);
+        let mut body = res.into_body();
+        gate_rx.await.unwrap(); // read only once the server has checked backpressure
+        let chunk = body.next().await.unwrap().unwrap();
+        let _ = done_tx.send(chunk);
+    })
+    .unwrap();
+
+    pool.run_until(async move {
+        let mut server = ServerSide::new(c2s_rx);
+        server.read_preface().await;
+        assert!(matches!(server.next_frame().await, Frame::Settings { .. }));
+        assert!(matches!(
+            server.next_frame().await,
+            Frame::Headers { stream_id: 1, .. }
+        ));
+        // Respond with the head + one body chunk (no END_STREAM).
+        s2c_tx
+            .unbounded_send(serialize_frame(&Frame::Settings {
+                ack: false,
+                settings: Settings::default(),
+            }))
+            .unwrap();
+        let head = HpackEncoder::new().encode(&[Header::new(":status", "200")]);
+        s2c_tx
+            .unbounded_send(serialize_frame(&Frame::Headers {
+                stream_id: 1,
+                header_block_fragment: head,
+                end_stream: false,
+                end_headers: true,
+                priority: None,
+            }))
+            .unwrap();
+        s2c_tx
+            .unbounded_send(serialize_frame(&Frame::Data {
+                stream_id: 1,
+                data: b"hello".to_vec(),
+                end_stream: false,
+            }))
+            .unwrap();
+
+        // Backpressure: the app hasn't read, so no WINDOW_UPDATE has been sent.
+        quiesce().await;
+        let mut pre = Vec::new();
+        while let Some(f) = server.try_next_frame() {
+            pre.push(f);
+        }
+        assert!(
+            !pre.iter().any(|f| matches!(f, Frame::WindowUpdate { .. })),
+            "replenished the window before the body was read"
+        );
+
+        // Let the client read one chunk → it returns those 5 bytes to both windows.
+        gate_tx.send(()).unwrap();
+        assert_eq!(done_rx.await.unwrap(), b"hello");
+
+        let (mut stream_wu, mut conn_wu) = (false, false);
+        for _ in 0..8 {
+            match server.next_frame().await {
+                Frame::WindowUpdate {
+                    stream_id: 1,
+                    window_size_increment,
+                } => {
+                    assert_eq!(window_size_increment, 5);
+                    stream_wu = true;
+                }
+                Frame::WindowUpdate {
+                    stream_id: 0,
+                    window_size_increment,
+                } => {
+                    assert_eq!(window_size_increment, 5);
+                    conn_wu = true;
+                }
+                _ => {}
+            }
+            if stream_wu && conn_wu {
+                break;
+            }
+        }
+        assert!(stream_wu && conn_wu, "consumption must replenish both windows");
     });
 }
 

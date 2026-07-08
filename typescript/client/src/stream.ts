@@ -51,31 +51,59 @@ export class H2Stream {
   /** The peer's send side has ended (we received END_STREAM). Likewise. */
   remoteClosed = false;
 
-  /** Bytes of response body still to be flow-accounted by the connection. */
+  /**
+   * Response body as a byte stream. **Backpressured**: DATA is buffered on
+   * receipt and the receive-flow window is replenished (`onConsume`) only as the
+   * consumer *reads* — so an unread body eventually stalls the sender rather than
+   * buffering unbounded (consumption-driven flow control, à la `node:http2`).
+   */
   readonly body: ReadableStream<Uint8Array>;
-  private bodyController!: ReadableStreamDefaultController<Uint8Array>;
 
   readonly head: Promise<HeadHead>;
   private resolveHead!: (h: HeadHead) => void;
   private rejectHead!: (e: unknown) => void;
 
   private gotHead = false;
-  private bodyClosed = false;
   /** Trailers (a HEADERS block received after DATA). */
   trailers?: Record<string, string>;
 
   /** For pushed streams: the promised request headers. */
   pushRequest?: HeadHead;
 
-  constructor(id: number, initialSendWindow: number, state: StreamState = "idle") {
+  // --- receive buffer (pull-based body) ---
+  /** Received chunks awaiting the consumer. */
+  private readonly recvQueue: Uint8Array[] = [];
+  /** Bytes buffered in `recvQueue` — received but not yet returned to the peer's
+   * flow window (via consumption or, on cancel, discard). */
+  private recvBuffered = 0;
+  private recvEnded = false;
+  private recvError: unknown;
+  /** Resolves a parked `pull` once data / end / error arrives. */
+  private recvNotify: (() => void) | undefined;
+  /** True once the body has been closed, errored, or cancelled. */
+  private bodyDone = false;
+  /** Return `n` consumed/abandoned bytes to the receive-flow windows. */
+  private readonly onConsume: (n: number) => void;
+
+  constructor(
+    id: number,
+    initialSendWindow: number,
+    state: StreamState = "idle",
+    onConsume: (n: number) => void = () => {},
+  ) {
     this.id = id;
     this.state = state;
     this.sendWindow = new SendWindow(initialSendWindow);
-    this.body = new ReadableStream<Uint8Array>({
-      start: (controller) => {
-        this.bodyController = controller;
+    this.onConsume = onConsume;
+    this.body = new ReadableStream<Uint8Array>(
+      {
+        pull: (controller) => this.pullBody(controller),
+        cancel: () => this.cancelBody(),
       },
-    });
+      // highWaterMark 0: never read ahead, so `pull` (and thus replenishment)
+      // happens exactly when the consumer asks for the next chunk.
+      { highWaterMark: 0 },
+    );
     this.head = new Promise<HeadHead>((resolve, reject) => {
       this.resolveHead = resolve;
       this.rejectHead = reject;
@@ -103,10 +131,12 @@ export class H2Stream {
   }
 
   receiveData(data: Uint8Array, endStream: boolean): void {
-    if (!this.bodyClosed && data.length > 0) {
-      this.bodyController.enqueue(data);
+    if (data.length > 0 && !this.bodyDone) {
+      this.recvQueue.push(data);
+      this.recvBuffered += data.length;
     }
-    if (endStream) this.endBody();
+    if (endStream) this.recvEnded = true;
+    this.wakeRecv();
   }
 
   receiveReset(errorCode: number): void {
@@ -123,23 +153,58 @@ export class H2Stream {
       this.gotHead = true;
       this.rejectHead(err);
     }
-    if (!this.bodyClosed) {
-      this.bodyClosed = true;
-      try {
-        this.bodyController.error(err);
-      } catch {
-        // controller may already be closed
-      }
-    }
+    // Deliver any already-buffered chunks first, then surface the error, so a
+    // reset mid-download doesn't look like a clean EOF.
+    if (this.recvError === undefined) this.recvError = err;
+    this.wakeRecv();
   }
 
   private endBody(): void {
-    if (this.bodyClosed) return;
-    this.bodyClosed = true;
-    try {
-      this.bodyController.close();
-    } catch {
-      // already closed
+    this.recvEnded = true;
+    this.wakeRecv();
+  }
+
+  private wakeRecv(): void {
+    const notify = this.recvNotify;
+    this.recvNotify = undefined;
+    notify?.();
+  }
+
+  /** ReadableStream pull: hand the consumer the next buffered chunk (or the
+   * end/error), replenishing the receive window for the bytes it takes. */
+  private async pullBody(controller: ReadableStreamDefaultController<Uint8Array>): Promise<void> {
+    for (;;) {
+      if (this.recvQueue.length > 0) {
+        const chunk = this.recvQueue.shift()!;
+        this.recvBuffered -= chunk.length;
+        controller.enqueue(chunk);
+        this.onConsume(chunk.length); // consumption-driven WINDOW_UPDATE
+        return;
+      }
+      if (this.recvError !== undefined) {
+        this.bodyDone = true;
+        controller.error(this.recvError);
+        return;
+      }
+      if (this.recvEnded) {
+        this.bodyDone = true;
+        controller.close();
+        return;
+      }
+      await new Promise<void>((resolve) => {
+        this.recvNotify = resolve;
+      });
     }
+  }
+
+  /** The consumer cancelled the body: return the window for the bytes still
+   * buffered (so the connection window doesn't leak), then discard them. */
+  private cancelBody(): void {
+    this.bodyDone = true;
+    if (this.recvBuffered > 0) {
+      this.onConsume(this.recvBuffered);
+      this.recvBuffered = 0;
+    }
+    this.recvQueue.length = 0;
   }
 }

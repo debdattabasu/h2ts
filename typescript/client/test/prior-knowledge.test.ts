@@ -84,12 +84,14 @@ describe("client connects via HTTP/2 prior knowledge (RFC 7540 §3.4)", () => {
     const req = conn.request({ method: "GET", path: "/hello", authority: "example.com" });
     req.catch(() => {}); // never resolved (no response fed); swallow on teardown
 
-    const { preface, frames } = await readStartup(clientReader, 2);
+    // Opening flight: SETTINGS, the connection-window WINDOW_UPDATE, then the
+    // request HEADERS — find the HEADERS rather than assume its position.
+    const { preface, frames } = await readStartup(clientReader, 3);
     expect(preface).toBe(PREFACE);
     expect(frames[0]!.type).toBe(FrameType.SETTINGS);
-    const headers = frames[1]!;
-    expect(headers.type).toBe(FrameType.HEADERS);
-    if (headers.type === FrameType.HEADERS) expect(headers.streamId).toBe(1);
+    const headers = frames.find((f) => f.type === FrameType.HEADERS);
+    expect(headers?.type).toBe(FrameType.HEADERS);
+    if (headers?.type === FrameType.HEADERS) expect(headers.streamId).toBe(1);
   });
 
   it("completes an optimistically-sent request when the server replies afterwards", async () => {
@@ -100,8 +102,8 @@ describe("client connects via HTTP/2 prior knowledge (RFC 7540 §3.4)", () => {
 
     // Wait until the client has actually written its request HEADERS (stream 1)
     // so the response we feed lands on a stream that exists.
-    const { frames } = await readStartup(clientReader, 2);
-    expect(frames[1]!.type).toBe(FrameType.HEADERS);
+    const { frames } = await readStartup(clientReader, 3);
+    expect(frames.some((f) => f.type === FrameType.HEADERS)).toBe(true);
     void drainRest(clientReader); // SETTINGS ack, WINDOW_UPDATEs, …
 
     // The server's preface and response arrive *after* the request was already

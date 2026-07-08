@@ -73,6 +73,14 @@ export interface ClientSettings {
 
 export interface ConnectOptions {
   settings?: ClientSettings;
+  /**
+   * Connection-level receive window in bytes. Default 64 MiB. Grown at startup
+   * from the HTTP/2 spec default of 65535 via a `WINDOW_UPDATE(0)`, then
+   * replenished as the application consumes response bodies (consumption-driven
+   * flow control). Keep it larger than the per-stream {@link ClientSettings.initialWindowSize}
+   * so a single unread stream can't stall the whole connection.
+   */
+  connectionWindowSize?: number;
   /** Called for each server push. If unset, pushes are refused. */
   onPush?: (push: PushedRequest) => void;
 }

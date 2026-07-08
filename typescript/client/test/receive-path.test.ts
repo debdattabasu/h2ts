@@ -234,6 +234,69 @@ describe("receive path: interim responses, settings validation, header cap", () 
   }, 8000);
 });
 
+describe("receive path: backpressure", () => {
+  it("grows the connection receive window at startup", async () => {
+    const { transport, clientReader } = mockTransport();
+    connect(transport, { connectionWindowSize: 1_000_000 });
+    const frames = new FrameReader(clientReader);
+    const wu = await frames.until((f) => f.type === FrameType.WINDOW_UPDATE && f.streamId === 0);
+    if (wu.type === FrameType.WINDOW_UPDATE) {
+      expect(wu.windowSizeIncrement).toBe(1_000_000 - 65535); // grown past the spec default
+    }
+  }, 8000);
+
+  it("replenishes the receive window only as the body is consumed", async () => {
+    const { transport, clientReader, serverWriter } = mockTransport();
+    const conn = connect(transport);
+    const frames = new FrameReader(clientReader);
+
+    const reqP = conn.request({ path: "/download", authority: "e" });
+    await frames.until((f) => f.type === FrameType.HEADERS);
+
+    // Record outbound frames from here (skips the startup connection WINDOW_UPDATE).
+    const seen: Frame[] = [];
+    void (async () => {
+      try {
+        for (;;) seen.push(await frames.next());
+      } catch {
+        /* closed */
+      }
+    })();
+    const tick = () => new Promise((r) => setTimeout(r, 15));
+    const streamWU = () => seen.filter((f) => f.type === FrameType.WINDOW_UPDATE && f.streamId === 1);
+    const connWU5 = () =>
+      seen.filter((f) => f.type === FrameType.WINDOW_UPDATE && f.streamId === 0 && f.windowSizeIncrement === 5);
+
+    await sendResponseHead(serverWriter); // SETTINGS + HEADERS(200, no END_STREAM)
+    await serverWriter.write(
+      serializeFrame({ type: FrameType.DATA, streamId: 1, data: encodeUtf8("hello"), endStream: false }),
+    );
+
+    const res = await reqP;
+    expect(res.status).toBe(200);
+
+    // Backpressure: nobody has read the body, so NO window has been returned yet
+    // (the old client replenished eagerly on receipt).
+    await tick();
+    expect(streamWU().length).toBe(0);
+    expect(connWU5().length).toBe(0);
+
+    // Read one chunk → the client returns exactly those 5 bytes to both windows.
+    const reader = res.body.getReader();
+    const { value } = await reader.read();
+    expect(decodeUtf8(value!)).toBe("hello");
+
+    const start = Date.now();
+    while (streamWU().length === 0) {
+      if (Date.now() - start > 2000) throw new Error("no WINDOW_UPDATE after consumption");
+      await tick();
+    }
+    const wu = streamWU()[0]!;
+    if (wu.type === FrameType.WINDOW_UPDATE) expect(wu.windowSizeIncrement).toBe(5);
+    expect(connWU5().length).toBe(1); // connection window replenished for the same bytes
+  }, 8000);
+});
+
 describe("receive path: max concurrent streams", () => {
   it("honors the peer's SETTINGS_MAX_CONCURRENT_STREAMS", async () => {
     const { transport, clientReader, serverWriter } = mockTransport();

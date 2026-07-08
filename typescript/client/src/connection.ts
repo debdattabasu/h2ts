@@ -69,7 +69,10 @@ export class H2Connection {
   /** Connection-level send window (peer's inbound window for us). */
   private readonly connSendWindow = new SendWindow(SPEC_INITIAL_WINDOW);
   private readonly localMaxFrameSize: number;
+  /** Our advertised per-stream receive window (SETTINGS_INITIAL_WINDOW_SIZE). */
   private readonly localInitialWindow: number;
+  /** Our connection-level receive window (grown at startup, replenished on consume). */
+  private readonly connRecvWindow: number;
   private readonly remote: RemoteSettings = {
     initialWindowSize: SPEC_INITIAL_WINDOW,
     maxFrameSize: DEFAULT_MAX_FRAME_SIZE,
@@ -112,6 +115,7 @@ export class H2Connection {
     const s = options.settings ?? {};
     this.localMaxFrameSize = s.maxFrameSize ?? DEFAULT_MAX_FRAME_SIZE;
     this.localInitialWindow = s.initialWindowSize ?? 1024 * 1024;
+    this.connRecvWindow = options.connectionWindowSize ?? 64 * 1024 * 1024;
     const headerTableSize = s.headerTableSize ?? 4096;
     const enablePush = s.enablePush ?? true;
 
@@ -131,6 +135,14 @@ export class H2Connection {
       maxFrameSize: this.localMaxFrameSize,
     };
     this.ready = this.send({ type: FrameType.SETTINGS, streamId: 0, ack: false, settings: localSettings });
+
+    // Grow the connection-level receive window past the spec default of 65535
+    // (§6.9.2). Thereafter it — like each stream window — is replenished only as
+    // the application consumes response bodies (consumption-driven backpressure).
+    const connGrow = this.connRecvWindow - SPEC_INITIAL_WINDOW;
+    if (connGrow > 0) {
+      void this.send({ type: FrameType.WINDOW_UPDATE, streamId: 0, windowSizeIncrement: connGrow });
+    }
 
     void this.readLoop();
   }
@@ -244,14 +256,9 @@ export class H2Connection {
 
       case FrameType.DATA: {
         const stream = this.streams.get(frame.streamId);
-        if (frame.data.length > 0) {
-          // Replenish on receipt (simple, constant receive window).
-          void this.send({ type: FrameType.WINDOW_UPDATE, streamId: 0, windowSizeIncrement: frame.data.length });
-          if (stream && !frame.endStream) {
-            void this.send({ type: FrameType.WINDOW_UPDATE, streamId: frame.streamId, windowSizeIncrement: frame.data.length });
-          }
-        }
         if (stream) {
+          // Buffer; the receive windows are replenished only as the app reads the
+          // body (consumption-driven backpressure — see H2Stream/replenishRecvWindow).
           stream.receiveData(frame.data, frame.endStream);
           // The peer half-closing does NOT end the stream while we are still
           // uploading — it becomes half-closed(remote) and our body pump (plus
@@ -261,6 +268,10 @@ export class H2Connection {
             stream.remoteClosed = true;
             this.retireIfFullyClosed(frame.streamId);
           }
+        } else if (frame.data.length > 0) {
+          // DATA on an unknown/retired stream: there is no consumer to drive
+          // replenishment, so return the connection window now (bytes discarded).
+          void this.send({ type: FrameType.WINDOW_UPDATE, streamId: 0, windowSizeIncrement: frame.data.length });
         }
         return;
       }
@@ -400,7 +411,9 @@ export class H2Connection {
       return;
     }
 
-    const stream = new H2Stream(promisedId, this.remote.initialWindowSize, "reservedRemote");
+    const stream = new H2Stream(promisedId, this.remote.initialWindowSize, "reservedRemote", (n) =>
+      this.replenishRecvWindow(promisedId, n),
+    );
     // A pushed stream is half-closed(local) from the start — the client never
     // sends a body on it — so its send side counts as done for retirement.
     stream.localClosed = true;
@@ -437,7 +450,9 @@ export class H2Connection {
 
     const id = this.nextStreamId;
     this.nextStreamId += 2;
-    const stream = new H2Stream(id, this.remote.initialWindowSize, "open");
+    const stream = new H2Stream(id, this.remote.initialWindowSize, "open", (n) =>
+      this.replenishRecvWindow(id, n),
+    );
     this.streams.set(id, stream); // reserves the slot synchronously
 
     const headers = buildRequestHeaders(init);
@@ -602,6 +617,20 @@ export class H2Connection {
       this.streams.delete(id);
       this.wakeStreamSlots(); // a freed slot may admit a parked request
     }
+  }
+
+  /**
+   * Return `n` bytes to our receive-flow windows once the application has
+   * consumed them from a response body (consumption-driven flow control). The
+   * stream window is replenished only while the stream is still open; the
+   * connection window always is (so an abandoned/retired stream can't leak it).
+   */
+  private replenishRecvWindow(streamId: number, n: number): void {
+    if (this.closedFlag || n <= 0) return;
+    if (this.streams.has(streamId)) {
+      void this.send({ type: FrameType.WINDOW_UPDATE, streamId, windowSizeIncrement: n });
+    }
+    void this.send({ type: FrameType.WINDOW_UPDATE, streamId: 0, windowSizeIncrement: n });
   }
 
   /** A connection-level protocol error: GOAWAY then tear down. */

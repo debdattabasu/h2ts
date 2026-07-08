@@ -13,10 +13,11 @@
 //! refused) and abort signals.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::rc::Rc;
-use std::task::Poll;
+use std::pin::Pin;
+use std::rc::{Rc, Weak};
+use std::task::{Context, Poll, Waker};
 
 use futures::channel::{mpsc, oneshot};
 use futures::future::{poll_fn, LocalBoxFuture};
@@ -114,6 +115,76 @@ impl From<&str> for RequestBody {
     }
 }
 
+/// Per-stream receive buffer, shared between the connection (which pushes DATA)
+/// and the [`ResponseBody`] (which pulls it). Bytes are held here until the
+/// consumer reads them, so an unread body applies backpressure rather than
+/// buffering unbounded (consumption-driven flow control, à la `node:http2`).
+#[derive(Default)]
+struct RecvState {
+    queue: VecDeque<Vec<u8>>,
+    /// Bytes buffered in `queue` — received but not yet returned to the receive
+    /// window (via consumption or, on drop, discard).
+    buffered: usize,
+    ended: bool,
+    error: Option<H2Error>,
+    waker: Option<Waker>,
+}
+
+/// A response body: a backpressured stream of byte-chunk results (`Err` on
+/// reset/failure, so a truncated body is never mistaken for a complete one). The
+/// connection replenishes the receive-flow window only as chunks are pulled.
+pub struct ResponseBody {
+    recv: Rc<RefCell<RecvState>>,
+    conn: Weak<RefCell<ConnState>>,
+    stream_id: u32,
+}
+
+impl ResponseBody {
+    /// Return `n` consumed/abandoned bytes to the receive windows.
+    fn replenish(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        if let Some(conn) = self.conn.upgrade() {
+            conn.borrow().replenish_recv_window(self.stream_id, n);
+        }
+    }
+}
+
+impl Stream for ResponseBody {
+    type Item = Result<Vec<u8>, H2Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let mut recv = this.recv.borrow_mut();
+        if let Some(chunk) = recv.queue.pop_front() {
+            let n = chunk.len();
+            recv.buffered -= n;
+            drop(recv); // release before touching the connection
+            this.replenish(n); // consumption-driven WINDOW_UPDATE
+            Poll::Ready(Some(Ok(chunk)))
+        } else if let Some(e) = recv.error.take() {
+            Poll::Ready(Some(Err(e)))
+        } else if recv.ended {
+            Poll::Ready(None)
+        } else {
+            recv.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+impl Drop for ResponseBody {
+    fn drop(&mut self) {
+        // Abandoned mid-stream: return the window for whatever is still buffered so
+        // the connection window doesn't leak.
+        let remaining = self.recv.borrow().buffered;
+        if remaining > 0 {
+            self.replenish(remaining);
+        }
+    }
+}
+
 /// A response. The body is a stream of byte-chunk results; a chunk is `Err` if the
 /// stream was reset or the connection failed mid-download, so a truncated body is
 /// never mistaken for a complete one (mirrors the TS body stream erroring).
@@ -121,15 +192,16 @@ pub struct Response {
     pub status: u16,
     pub headers: HashMap<String, String>,
     pub raw_headers: Vec<Header>,
-    body: mpsc::UnboundedReceiver<Result<Vec<u8>, H2Error>>,
+    body: ResponseBody,
     /// Trailers (a HEADERS block after the body). Shared with the stream, which
     /// fills it in when they arrive; readable once the body has ended.
     trailers: Rc<RefCell<Option<HashMap<String, String>>>>,
 }
 
 impl Response {
-    /// The response body as a stream of chunk results (`Err` on reset/failure).
-    pub fn into_body(self) -> mpsc::UnboundedReceiver<Result<Vec<u8>, H2Error>> {
+    /// The response body as a backpressured stream of chunk results (`Err` on
+    /// reset/failure). The receive window is replenished as chunks are pulled.
+    pub fn into_body(self) -> ResponseBody {
         self.body
     }
 
@@ -159,8 +231,15 @@ impl Response {
 pub struct ConnectOptions {
     pub header_table_size: Option<usize>,
     pub enable_push: Option<bool>,
+    /// Our advertised per-stream receive window (SETTINGS_INITIAL_WINDOW_SIZE).
+    /// Default 1 MiB. Replenished as the application consumes response bodies.
     pub initial_window_size: Option<u32>,
     pub max_frame_size: Option<usize>,
+    /// Our connection-level receive window in bytes. Default 64 MiB. Grown at
+    /// startup from the spec default of 65535 via a `WINDOW_UPDATE(0)`, then
+    /// replenished on consumption. Keep it larger than `initial_window_size` so a
+    /// single unread stream can't stall the whole connection.
+    pub connection_window_size: Option<u32>,
     // TODO: on_push callback (pushes are currently refused).
 }
 
@@ -205,12 +284,13 @@ struct StreamState {
     id: u32,
     send_window: SendWindow,
     head_tx: Option<oneshot::Sender<Result<Head, H2Error>>>,
-    body_tx: Option<mpsc::UnboundedSender<Result<Vec<u8>, H2Error>>>,
+    /// Receive buffer shared with the `Response`'s [`ResponseBody`]. DATA is
+    /// pushed here and pulled by the consumer; the window is replenished on read.
+    recv: Rc<RefCell<RecvState>>,
     /// Trailers cell shared with the `Response`; set when a post-body HEADERS block
     /// (trailers) arrives.
     trailers: Rc<RefCell<Option<HashMap<String, String>>>>,
     got_head: bool,
-    body_closed: bool,
     /// Our send side is done (we sent END_STREAM: bodyless HEADERS, or the body
     /// pump's terminal DATA). Until then the stream is at most half-closed.
     local_closed: bool,
@@ -224,10 +304,9 @@ impl StreamState {
             id,
             send_window: SendWindow::new(initial_send_window),
             head_tx: None,
-            body_tx: None,
+            recv: Rc::new(RefCell::new(RecvState::default())),
             trailers: Rc::new(RefCell::new(None)),
             got_head: false,
-            body_closed: false,
             local_closed: false,
             remote_closed: false,
         }
@@ -256,13 +335,16 @@ impl StreamState {
     }
 
     fn receive_data(&mut self, data: &[u8], end_stream: bool) {
-        if !self.body_closed && !data.is_empty() {
-            if let Some(tx) = &self.body_tx {
-                let _ = tx.unbounded_send(Ok(data.to_vec()));
-            }
+        let mut recv = self.recv.borrow_mut();
+        if !data.is_empty() && recv.error.is_none() && !recv.ended {
+            recv.queue.push_back(data.to_vec());
+            recv.buffered += data.len();
         }
         if end_stream {
-            self.end_body();
+            recv.ended = true;
+        }
+        if let Some(w) = recv.waker.take() {
+            w.wake();
         }
     }
 
@@ -283,22 +365,26 @@ impl StreamState {
                 let _ = tx.send(Err(err.clone()));
             }
         }
-        // Error the body (if still open) so a reset/failed download surfaces rather
-        // than looking like a clean EOF — matching the TS body stream erroring.
-        if !self.body_closed {
-            if let Some(tx) = &self.body_tx {
-                let _ = tx.unbounded_send(Err(err));
-            }
+        // Surface the error after any already-buffered chunks (the body delivers
+        // its queue first, then this error) so a reset/failed download errors
+        // rather than looking like a clean EOF — matching the TS body.
+        let mut recv = self.recv.borrow_mut();
+        if recv.error.is_none() {
+            recv.error = Some(err);
         }
-        self.end_body();
+        if let Some(w) = recv.waker.take() {
+            w.wake();
+        }
     }
 
     fn end_body(&mut self) {
-        if self.body_closed {
-            return;
+        let mut recv = self.recv.borrow_mut();
+        if !recv.ended {
+            recv.ended = true;
+            if let Some(w) = recv.waker.take() {
+                w.wake();
+            }
         }
-        self.body_closed = true;
-        self.body_tx = None;
     }
 }
 
@@ -494,25 +580,21 @@ impl ConnState {
                 data,
                 end_stream,
             } => {
-                let has_stream = self.streams.contains_key(&stream_id);
-                if !data.is_empty() {
-                    // Replenish on receipt (simple constant receive window).
-                    self.send_frame(Frame::WindowUpdate {
-                        stream_id: 0,
-                        window_size_increment: data.len() as u32,
-                    });
-                    if has_stream && !end_stream {
-                        self.send_frame(Frame::WindowUpdate {
-                            stream_id,
-                            window_size_increment: data.len() as u32,
-                        });
-                    }
-                }
                 if let Some(s) = self.streams.get_mut(&stream_id) {
+                    // Buffer; the receive windows are replenished only as the app
+                    // reads the body (consumption-driven backpressure — see
+                    // ResponseBody / replenish_recv_window).
                     s.receive_data(&data, end_stream);
                     if end_stream {
                         s.remote_closed = true;
                     }
+                } else if !data.is_empty() {
+                    // DATA on an unknown/retired stream: no consumer to drive
+                    // replenishment, so return the connection window now (discarded).
+                    self.send_frame(Frame::WindowUpdate {
+                        stream_id: 0,
+                        window_size_increment: data.len() as u32,
+                    });
                 }
                 // The peer half-closing does NOT end the stream while we are still
                 // uploading — it becomes half-closed(remote) and our body pump must
@@ -736,6 +818,27 @@ impl ConnState {
         }
     }
 
+    /// Return `n` bytes to our receive-flow windows once the application has
+    /// consumed them from a response body (consumption-driven flow control). The
+    /// stream window is replenished only while the stream is still open; the
+    /// connection window always is (so an abandoned/retired stream can't leak it).
+    fn replenish_recv_window(&self, stream_id: u32, n: usize) {
+        if self.closed || n == 0 {
+            return;
+        }
+        let inc = n as u32;
+        if self.streams.contains_key(&stream_id) {
+            self.send_frame(Frame::WindowUpdate {
+                stream_id,
+                window_size_increment: inc,
+            });
+        }
+        self.send_frame(Frame::WindowUpdate {
+            stream_id: 0,
+            window_size_increment: inc,
+        });
+    }
+
     // --- concurrent-stream limiting (§5.1.2) ---
 
     /// Client-initiated (odd-id) streams currently open or half-closed — the ones
@@ -857,7 +960,7 @@ impl H2Connection {
 
         let id;
         let head_rx;
-        let body_rx;
+        let recv;
         let task_tx;
         let trailers;
         {
@@ -878,17 +981,15 @@ impl H2Connection {
             st.next_stream_id += 2;
 
             let (htx, hrx) = oneshot::channel();
-            let (btx, brx) = mpsc::unbounded();
             let initial = st.remote.initial_window_size;
             let mut stream = StreamState::new(id, initial);
             stream.head_tx = Some(htx);
-            stream.body_tx = Some(btx);
             // A bodyless request half-closes immediately (HEADERS carries END_STREAM).
             stream.local_closed = !has_body;
             trailers = stream.trailers.clone();
+            recv = stream.recv.clone(); // shared with the ResponseBody built below
             st.streams.insert(id, stream);
             head_rx = hrx;
-            body_rx = brx;
 
             let headers = build_request_headers(&init);
             let block = st.encoder.encode(&headers);
@@ -909,7 +1010,11 @@ impl H2Connection {
                 status: head.status,
                 headers: head.headers,
                 raw_headers: head.raw,
-                body: body_rx,
+                body: ResponseBody {
+                    recv,
+                    conn: Rc::downgrade(&self.shared),
+                    stream_id: id,
+                },
                 trailers,
             }),
             Ok(Err(e)) => Err(e),
@@ -1142,6 +1247,7 @@ pub fn connect(
 
     let local_max_frame_size = options.max_frame_size.unwrap_or(DEFAULT_MAX_FRAME_SIZE);
     let local_initial_window = options.initial_window_size.unwrap_or(1024 * 1024);
+    let conn_recv_window = options.connection_window_size.unwrap_or(64 * 1024 * 1024);
     let header_table_size = options.header_table_size.unwrap_or(4096);
     let enable_push = options.enable_push.unwrap_or(true);
 
@@ -1180,6 +1286,16 @@ pub fn connect(
                 ..Default::default()
             },
         });
+        // Grow the connection-level receive window past the spec default of 65535
+        // (§6.9.2). Thereafter it — like each stream window — is replenished only
+        // as the application consumes response bodies (consumption-driven).
+        let grow = conn_recv_window as i64 - SPEC_INITIAL_WINDOW;
+        if grow > 0 {
+            st.send_frame(Frame::WindowUpdate {
+                stream_id: 0,
+                window_size_increment: grow as u32,
+            });
+        }
     }
 
     let driver = drive(
