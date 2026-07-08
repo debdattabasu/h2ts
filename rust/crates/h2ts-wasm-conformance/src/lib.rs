@@ -242,6 +242,35 @@ pub async fn run_battery(ws_url: String) -> Result<JsValue, JsValue> {
         Err(e) => c.check("GET /nope", false, &format!("{e}")),
     }
 
+    // 11. Response trailers (HEADERS after DATA)
+    match conn.request(get("/trailers")).await {
+        Ok(mut r) => {
+            let body = r.text().await.unwrap_or_default();
+            c.check("trailers: body", body == "trailer-body", &body);
+            let val = r
+                .trailers()
+                .and_then(|m| m.get("x-trailer").cloned())
+                .unwrap_or_default();
+            c.check("trailers: x-trailer", val == "after-body", &val);
+        }
+        Err(e) => c.check("trailers", false, &format!("{e}")),
+    }
+
+    // 12. 1xx interim (103 Early Hints) not mistaken for the final response
+    match conn.request(get("/early-hints")).await {
+        Ok(mut r) => {
+            let status = r.status;
+            c.check(
+                "1xx: final status 200",
+                status == 200,
+                &format!("status={status}"),
+            );
+            let body = r.text().await.unwrap_or_default();
+            c.check("1xx: final body", body == "final-body", &body);
+        }
+        Err(e) => c.check("1xx interim", false, &format!("{e}")),
+    }
+
     log(if c.failures == 0 {
         "\n✅ ALL E2E PASSED (rust wasm client)"
     } else {

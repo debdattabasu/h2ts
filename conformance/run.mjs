@@ -80,6 +80,16 @@ check("streamed /big size", streamed === 256 * 1024, `got ${streamed}`);
 const r10 = await client.request({ path: "/nope", authority: AUTH });
 check("GET /nope -> 404", r10.status === 404, `status=${r10.status}`);
 
+// 11. Response trailers (HEADERS after DATA)
+const r11 = await client.request({ path: "/trailers", authority: AUTH });
+check("trailers: body", (await r11.text()) === "trailer-body");
+check("trailers: x-trailer", r11.trailers()?.["x-trailer"] === "after-body");
+
+// 12. 1xx interim (103 Early Hints) not mistaken for the final response
+const r12 = await client.request({ path: "/early-hints", authority: AUTH });
+check("1xx: final status 200", r12.status === 200, `status=${r12.status}`);
+check("1xx: final body", (await r12.text()) === "final-body");
+
 // Print the summary BEFORE teardown so results aren't lost if close() races.
 console.log(failures === 0 ? "\n✅ ALL E2E PASSED" : `\n❌ ${failures} E2E FAILURE(S)`);
 

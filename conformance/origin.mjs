@@ -56,6 +56,24 @@ server.on("stream", (stream, headers) => {
     return;
   }
 
+  if (path === "/trailers") {
+    // Response trailers: a HEADERS block sent AFTER the body. The client should
+    // surface them via response.trailers() once the body has been read.
+    stream.respond({ "content-type": "text/plain", ":status": 200 }, { waitForTrailers: true });
+    stream.on("wantTrailers", () => stream.sendTrailers({ "x-trailer": "after-body" }));
+    stream.end("trailer-body");
+    return;
+  }
+
+  if (path === "/early-hints") {
+    // A 103 Early Hints informational (1xx) response before the final 200. The
+    // client must NOT mistake the 1xx for the final response (RFC 7540 §8.1).
+    stream.additionalHeaders({ ":status": 103, link: "</style.css>; rel=preload" });
+    stream.respond({ "content-type": "text/plain", ":status": 200 });
+    stream.end("final-body");
+    return;
+  }
+
   stream.respond({ ":status": 404 });
   stream.end("not found\n");
 });
