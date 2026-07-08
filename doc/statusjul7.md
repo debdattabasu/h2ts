@@ -29,6 +29,7 @@ unambiguous, low-risk items from §2; receive-side backpressure is deferred to t
 | Server upstream close codes | ✅ nginx-style 1014 (round 3) | ✅ nginx-style 1014 (round 3) |
 | Receive-side backpressure | ✅ consumption-driven (round 4) | ✅ consumption-driven (round 4) |
 | Server dead-peer liveness (keepalive) | ✅ on by default (round 2) | ✅ on by default (round 2) |
+| Server Origin allowlist (CSWSH, opt-in) | ✅ round 7 | ✅ round 7 |
 
 ---
 
@@ -138,10 +139,21 @@ TS client 42, Rust client connection suite 20; TS typecheck clean.
   through the real `h2ts-proxy` → origin. (Early-complete/constrained-window stay unit-only — see
   §3.)
 
-### Still open (deferred / needs a decision)
+### Fixed — round 7 (2026-07-09)
 
-- **`Origin` allowlist + `Sec-WebSocket-Version` negotiation [#11] — LOW/security.** Needs a
-  config/policy decision.
+- **Origin allowlist [#11] — "whatever nginx does".** nginx does **no** `Origin` validation by
+  default and leaves it as an opt-in allowlist; likewise it doesn't enforce `Sec-WebSocket-Version`.
+  Matched exactly: added an opt-in `AcceptOptions::allowed_origins` (default `None` = permissive) —
+  when set, only listed origins are accepted (ASCII case-insensitive); everything else, including a
+  *missing* `Origin`, gets a `403` (`WebSocketError::ForbiddenOrigin`, a CSWSH defence). The proxy
+  exposes it via a repeatable `--allowed-origin <origin>` flag. `Sec-WebSocket-Version` enforcement
+  is deliberately **declined** (nginx-faithful). Tested (allowed / disallowed→403 / missing→403 /
+  permissive default) plus an e2e smoke test through the proxy (bad origin→403, good→101).
+
+### Audit complete
+
+No open items remain. (`Sec-WebSocket-Version` enforcement was consciously declined as
+nginx-faithful; revisit only if strict RFC 6455 §4.2.1 conformance is ever wanted.)
 
 ---
 
@@ -226,4 +238,9 @@ exercised by the 512 KiB upload through the origin's 64 KiB window.
   three client batteries (TS `run.mjs`, Rust native, Rust wasm). **20/20 pass** e2e for TS, Rust,
   and wasm through `h2ts-proxy` → origin. (Cleared a stale origin process left by an earlier
   aborted run first.)
-- [ ] Still open (see §2 "Still open"): `Origin`/`Sec-WebSocket-Version` [#11] — the last item.
+- [x] **Round 7 — Origin allowlist (nginx-style, opt-in)** — _done 2026-07-09._ Added
+  `AcceptOptions::allowed_origins` (default `None` = permissive, like nginx) enforcing a CSWSH
+  allowlist → `403 ForbiddenOrigin` on a missing/unlisted `Origin`; proxy `--allowed-origin <origin>`
+  flag (repeatable). `Sec-WebSocket-Version` enforcement declined (nginx doesn't). 4 handshake tests
+  + e2e smoke (bad→403, good→101). **h2ts-server 24 tests**; clippy clean. **This closes the audit —
+  no open items.**
