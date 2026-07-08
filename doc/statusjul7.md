@@ -27,7 +27,7 @@ unambiguous, low-risk items from §2; receive-side backpressure is deferred to t
 | SETTINGS validation / header-block cap | ✅ fixed (round 2) | ✅ fixed (round 2) |
 | Max concurrent streams (enforce + pool) | ✅ fixed (round 3) | ✅ fixed (round 3) |
 | Server upstream close codes | ✅ nginx-style 1014 (round 3) | ✅ nginx-style 1014 (round 3) |
-| Receive-side backpressure | ⚠️ open (deferred) | ⚠️ open (deferred) |
+| Receive-side backpressure | ✅ consumption-driven (round 4) | ✅ consumption-driven (round 4) |
 | Server dead-peer liveness (keepalive) | ✅ on by default (round 2) | ✅ on by default (round 2) |
 
 ---
@@ -104,12 +104,22 @@ TS client 42, Rust client connection suite 20; TS typecheck clean.
   (`StrictMaxConcurrentStreams = false`); real multiplexing first, extra connections only under
   load. Mirrored + tested in both clients (per-connection enforcement + pool routing).
 
+### Fixed — round 4 (2026-07-09)
+
+- **Receive-side backpressure [was #2, #3] — "whatever node:http2 does".** Both clients replaced
+  eager, on-receipt `WINDOW_UPDATE` + unbounded buffering with **consumption-driven** flow
+  control: DATA is buffered per stream and the stream + connection receive windows are
+  replenished only as the application *reads* the body — so an unread body stalls the sender
+  instead of growing memory. The connection window is grown at startup past the 65535 spec
+  default (config `connectionWindowSize` / `connection_window_size`, default **64 MiB**, kept
+  larger than the **1 MiB** stream window so a single unread stream can't stall the whole
+  connection). TS: pull-based `ReadableStream` (highWaterMark 0) with cancel-returns-window;
+  Rust: `RecvState` + `ResponseBody` (`Stream`) with drop-returns-window. Mirrored tests
+  (no replenish before a read; both windows returned on consume; startup growth) + conformance
+  16/16 both clients.
+
 ### Still open (deferred / needs a decision)
 
-- **Receive-side backpressure + connection-window growth [#2, #3] — MEDIUM (deferred by
-  request).** Both clients still replenish `WINDOW_UPDATE` eagerly and buffer unbounded, and
-  the connection receive window stays pinned at 64 KiB — a real body-delivery design change
-  (gate replenishment on app consumption; grow the connection window), planned for the next pass.
 - **`Origin` allowlist + `Sec-WebSocket-Version` negotiation [#11] — LOW/security.** Needs a
   config/policy decision.
 
@@ -167,5 +177,15 @@ receive; inbound PUSH_PROMISE at the connection layer; oversized-header split on
   in Rust, wasm-wired). Mirrored tests: enforcement (`honors_the_peers_max_concurrent_streams`)
   + pool routing (5 each). **Suites green:** TS client 51, Rust client 55 (connection 24 + pool
   5 + frames 11 + hpack 15), Rust server 59; clippy clean (native + wasm32).
-- [ ] Still open (see §2 "Still open"): receive-side backpressure [#2, #3] (deferred by
-  request), `Origin`/`Sec-WebSocket-Version` [#11].
+- [x] **Round 4 — receive-side backpressure** — _done 2026-07-09._ Replaced eager on-receipt
+  `WINDOW_UPDATE` + unbounded body buffering with **consumption-driven** flow control in both
+  clients (node:http2-style): DATA is buffered and the stream + connection windows are
+  replenished only as the app reads the body; unread bodies apply backpressure. Connection
+  window grown at startup (config, default 64 MiB) above the 1 MiB stream window to avoid
+  connection-level HOL. TS pull-based `ReadableStream` (HWM 0) + cancel-returns-window; Rust
+  `RecvState`/`ResponseBody` + drop-returns-window (public `into_body()` now yields
+  `ResponseBody`). Mirrored tests (`replenishes_the_receive_window_only_on_consumption`,
+  TS "replenishes … only as the body is consumed" + startup-growth). **Suites green:** TS
+  client 53, Rust client 56 (connection 25 + pool 5 + frames 11 + hpack 15), Rust server 50;
+  clippy clean (native + wasm32); conformance 16/16 both clients.
+- [ ] Still open (see §2 "Still open"): `Origin`/`Sec-WebSocket-Version` [#11].
