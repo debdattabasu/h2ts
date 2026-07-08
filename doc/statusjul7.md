@@ -118,20 +118,36 @@ TS client 42, Rust client connection suite 20; TS typecheck clean.
   (no replenish before a read; both windows returned on consume; startup growth) + conformance
   16/16 both clients.
 
+### Fixed — round 5 (2026-07-09)
+
+- **Receive-path robustness coverage + a TS hang fix.** Added mirrored tests in both clients for
+  the implemented-but-untested edges (§3): stream-level `WINDOW_UPDATE(0)` → RST_STREAM,
+  frame > `MAX_FRAME_SIZE` → GOAWAY, padded HEADERS on receive, inbound PUSH_PROMISE refused
+  (REFUSED_STREAM), oversized-header split into HEADERS + CONTINUATION on send. Writing the first
+  test surfaced a **real bug**: TS `resetStream` removed the stream without failing its pending
+  request, so a stream-level `WINDOW_UPDATE(0)` would **hang** `request()` forever. Fixed —
+  `resetStream` now fails the stream (Rust `reset_stream` likewise fails it with a proper error
+  rather than a generic dropped-sender cancel).
+
 ### Still open (deferred / needs a decision)
 
 - **`Origin` allowlist + `Sec-WebSocket-Version` negotiation [#11] — LOW/security.** Needs a
   config/policy decision.
+- **Extend the conformance origin** to drive early-complete / 1xx / trailers / constrained-window
+  so the shared battery catches these instead of relying on hand-written mirror tests.
 
 ---
 
 ## 3. Coverage gaps (from the mapped matrix)
 
-The conformance origin never sends early responses, 1xx, trailers, padded frames, deliberate
-GOAWAY/RST/SETTINGS changes, or a constrained window — so the battery is happy-path only.
-Untested in **both** clients (beyond the early-complete case now fixed): 1xx; receive
-backpressure; stream-level `WINDOW_UPDATE(0)`; frame > `MAX_FRAME_SIZE`; padded HEADERS on
-receive; inbound PUSH_PROMISE at the connection layer; oversized-header split on *send*.
+The conformance origin only drives the happy path, so these receive-path edges were covered by
+mirrored unit tests instead. **Closed in round 5** (both clients): stream-level
+`WINDOW_UPDATE(0)` → RST_STREAM (which also surfaced + fixed a real TS hang — see round 5),
+frame > `MAX_FRAME_SIZE` → GOAWAY, padded HEADERS on receive, inbound PUSH_PROMISE refused,
+and oversized-header split on *send*. (1xx and receive backpressure were closed in rounds 2/4.)
+**Still open:** extending the conformance origin itself to drive early-complete / 1xx /
+trailers / constrained-window, so the shared battery — not just hand-written mirror tests —
+catches this class.
 
 ---
 
@@ -188,4 +204,12 @@ receive; inbound PUSH_PROMISE at the connection layer; oversized-header split on
   TS "replenishes … only as the body is consumed" + startup-growth). **Suites green:** TS
   client 53, Rust client 56 (connection 25 + pool 5 + frames 11 + hpack 15), Rust server 50;
   clippy clean (native + wasm32); conformance 16/16 both clients.
-- [ ] Still open (see §2 "Still open"): `Origin`/`Sec-WebSocket-Version` [#11].
+- [x] **Round 5 — receive-path robustness coverage + resetStream hang fix** — _done 2026-07-09._
+  Mirrored tests in both clients for stream `WINDOW_UPDATE(0)` → RST, frame > MAX_FRAME_SIZE →
+  GOAWAY, padded HEADERS on receive, PUSH_PROMISE refused, oversized-header split on send. The
+  first test found a real TS hang (`resetStream` didn't fail the pending request on a stream
+  reset); fixed in both clients. **Suites green:** TS client 58, Rust client 61 (connection 30 +
+  pool 5 + frames 11 + hpack 15); Rust server 20; clippy clean (native + wasm32); conformance
+  16/16 both clients.
+- [ ] Still open (see §2 "Still open"): `Origin`/`Sec-WebSocket-Version` [#11]; extend the
+  conformance origin to drive early-complete / 1xx / trailers / constrained-window.
