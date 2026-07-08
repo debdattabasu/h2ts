@@ -181,6 +181,26 @@ fn accept_with_honors_a_selection_even_without_h2ts() {
 }
 
 #[test]
+fn accept_with_never_echoes_an_unoffered_subprotocol() {
+    // A misbehaving handler returns a subprotocol the client did NOT offer. The
+    // server must not echo it (RFC 6455 §4.2.2 — the client would fail the
+    // connection); it falls back to the default policy. Here the client also
+    // offered h2ts, so h2ts is echoed instead of the un-offered "evil".
+    let mut req = upgrade_request(Some("h2ts, chat"));
+    let (resp, _fut) = accept_with(&mut req, |_offered| Some("evil".to_string())).unwrap();
+    assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
+    assert_eq!(resp.headers().get(SEC_WEBSOCKET_PROTOCOL).unwrap(), "h2ts");
+
+    // With no acceptable fallback (no h2ts offered, implicit codec off), an
+    // un-offered selection rejects rather than being echoed.
+    let mut req = upgrade_request(Some("chat, binary"));
+    let err = accept_with(&mut req, |_offered| Some("evil".to_string()))
+        .err()
+        .expect("un-offered selection with no fallback must reject");
+    assert!(matches!(err, WebSocketError::UnsupportedSubprotocol));
+}
+
+#[test]
 fn allow_implicit_codec_accepts_the_first_offered_codec() {
     let opts = AcceptOptions {
         allow_implicit_codec: true,

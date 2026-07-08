@@ -115,6 +115,11 @@ impl AsyncWrite for WsByteStream {
 /// The WebSocket is presented as a byte stream via [`WsByteStream`] and the
 /// request/response traffic is real HTTP/2 (h2c, prior-knowledge) on top.
 ///
+/// The tunnel runs server-initiated WebSocket keepalive **on by default**
+/// ([`BridgeConfig::default`]) so a silently-dead client can't leak the
+/// connection; use [`serve_h2_with`] with a custom [`BridgeConfig`] to tune or
+/// disable it (`keepalive: None`).
+///
 /// Typical use in a route handler:
 /// ```ignore
 /// let (response, ws_fut) = h2ts_server::accept(&mut req)?;

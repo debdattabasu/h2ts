@@ -290,19 +290,37 @@ impl KeepAlive {
     }
 }
 
+impl Default for KeepAlive {
+    /// Sensible server defaults: ping an idle connection every 30s and close it
+    /// (1001 Going Away) if no frame arrives within a further 15s. This is what
+    /// [`BridgeConfig::default`] (and thus [`bridge`] / [`serve_h2`](crate::serve_h2))
+    /// use — keepalive is **on by default**. Tune via [`KeepAlive::new`], or set
+    /// [`BridgeConfig::keepalive`] to `None` to opt out.
+    fn default() -> Self {
+        Self::new(Duration::from_secs(30), Duration::from_secs(15))
+    }
+}
+
 /// Control-frame configuration and hooks for [`bridge_with`] /
 /// [`serve_h2_with`](crate::serve_h2_with).
 ///
-/// [`BridgeConfig::default`] reproduces plain [`bridge`] behaviour: wslay
-/// auto-answers pings with pongs, a Normal Closure is sent on teardown, no
-/// keepalive, and no hooks fire. All fields are opt-in.
-#[derive(Default)]
+/// [`BridgeConfig::default`] enables **server-initiated keepalive on by default**
+/// ([`KeepAlive::default`]: 30s ping / 15s timeout / 1001) so a silently-dead peer
+/// can't leak the bridge; wslay still auto-answers incoming pings, a Normal
+/// Closure is sent on teardown, and no hooks fire. To opt out of keepalive, set
+/// [`keepalive`](BridgeConfig::keepalive) to `None`.
 pub struct BridgeConfig {
-    /// Close frame this side sends when it starts the close (e.g. the peer /
-    /// upstream reached EOF). Defaults to 1000 Normal Closure, empty reason.
+    /// Close frame this side sends when it starts the close after the peer/upstream
+    /// reached a **clean** EOF. Defaults to 1000 Normal Closure, empty reason.
     pub close: CloseFrame,
-    /// Server-initiated keepalive (ping-and-timeout). `None` disables it — send
-    /// your own pings via [`control_channel`] instead.
+    /// Close frame this side sends when it tears down because the peer/upstream
+    /// **errored** (a read/write failure — e.g. a reset — not a clean EOF).
+    /// Defaults to 1011 (Internal Error); the proxy sets 1014 (Bad Gateway) so a
+    /// failed upstream is distinguishable from a clean shutdown (à la nginx 502).
+    pub error_close: CloseFrame,
+    /// Server-initiated keepalive (ping-and-timeout). Defaults to
+    /// `Some(`[`KeepAlive::default`]`)`; set to `None` to opt out (and optionally
+    /// drive your own pings via [`control_channel`] instead).
     pub keepalive: Option<KeepAlive>,
     /// Receiver from [`control_channel`], to send control frames while running.
     pub control: Option<ControlReceiver>,
@@ -314,6 +332,26 @@ pub struct BridgeConfig {
     pub on_ping: Option<ControlHook>,
     /// Called when a Pong is received.
     pub on_pong: Option<ControlHook>,
+}
+
+impl Default for BridgeConfig {
+    fn default() -> Self {
+        Self {
+            close: CloseFrame::default(),
+            // An errored (vs cleanly-closed) peer/upstream tears down with 1011.
+            error_close: CloseFrame {
+                code: wslay_status_code_WSLAY_CODE_INTERNAL_SERVER_ERROR as u16,
+                reason: String::new(),
+            },
+            // Keepalive is on by default (opt out with `keepalive: None`) so a
+            // peer that dies without a TCP FIN can't leak the bridge task.
+            keepalive: Some(KeepAlive::default()),
+            control: None,
+            on_close: None,
+            on_ping: None,
+            on_pong: None,
+        }
+    }
 }
 
 /// Why the bridge ended — used to surface a close reason to `on_close`.
@@ -374,12 +412,16 @@ where
 {
     let BridgeConfig {
         close,
+        error_close,
         keepalive,
         control,
         mut on_close,
         mut on_ping,
         mut on_pong,
     } = config;
+    // `ws_to_peer` needs its own copy of the error close (the `peer_to_ws` closure
+    // takes the original).
+    let error_close_ws = error_close.clone();
 
     let (mut ws_read, ws_write) = tokio::io::split(ws_io);
     let (mut peer_read, mut peer_write) = tokio::io::split(peer);
@@ -450,8 +492,21 @@ where
                         std::mem::take(&mut s.control_events),
                     )
                 };
-                if !to_peer.is_empty() {
-                    peer_write.write_all(&to_peer).await?;
+                if !to_peer.is_empty() && peer_write.write_all(&to_peer).await.is_err() {
+                    // Upstream write failed: tell the client with the error close
+                    // (1011 by default, 1014 for a proxy) rather than a bare 1006.
+                    let outbound = unsafe {
+                        let ctx = ctx_addr as wslay_event_context_ptr;
+                        queue_close(ctx, error_close_ws.code, error_close_ws.reason.as_bytes());
+                        wslay_event_send(ctx);
+                        std::mem::take(
+                            &mut (*(sp_addr as *const RefCell<Shared>)).borrow_mut().outbound,
+                        )
+                    };
+                    if !outbound.is_empty() {
+                        let _ = ws_write.lock().await.write_all(&outbound).await;
+                    }
+                    return Ok(EndReason::LocalClose(error_close_ws.clone()));
                 }
                 let mut peer_close = None;
                 for event in events {
@@ -497,10 +552,15 @@ where
             let mut buf = vec![0u8; READ_CHUNK];
             loop {
                 let n = match peer_read.read(&mut buf).await {
-                    Ok(0) | Err(_) => {
+                    Ok(n) if n > 0 => n,
+                    other => {
+                        // Ok(0) = clean upstream EOF -> `close` (1000 by default; any
+                        // h2 GOAWAY already flowed through as bytes). Err = upstream
+                        // failure/reset -> `error_close` (1011, or 1014 for a proxy).
+                        let cf = if other.is_ok() { &close } else { &error_close };
                         let outbound = unsafe {
                             let ctx = ctx_addr as wslay_event_context_ptr;
-                            queue_close(ctx, close.code, close.reason.as_bytes());
+                            queue_close(ctx, cf.code, cf.reason.as_bytes());
                             wslay_event_send(ctx);
                             std::mem::take(
                                 &mut (*(sp_addr as *const RefCell<Shared>)).borrow_mut().outbound,
@@ -509,9 +569,8 @@ where
                         if !outbound.is_empty() {
                             let _ = ws_write.lock().await.write_all(&outbound).await;
                         }
-                        return Ok(EndReason::LocalClose(close));
+                        return Ok(EndReason::LocalClose(cf.clone()));
                     }
-                    Ok(n) => n,
                 };
                 let outbound = unsafe {
                     let ctx = ctx_addr as wslay_event_context_ptr;

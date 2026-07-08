@@ -239,8 +239,13 @@ where
     // reject).
     let offered = offered_protocols(request);
     let decision = match select(&offered) {
-        Some(proto) => Fallback::Accept(Some(proto)),
-        None => fallback_subprotocol(&offered, options.allow_implicit_codec),
+        // Never echo a subprotocol the client did not offer (RFC 6455 §4.2.2 — the
+        // client fails the connection if we do). A selection outside the offered
+        // list is treated as a decline and falls back to the default policy.
+        Some(proto) if offered.iter().any(|o| o.eq_ignore_ascii_case(&proto)) => {
+            Fallback::Accept(Some(proto))
+        }
+        _ => fallback_subprotocol(&offered, options.allow_implicit_codec),
     };
     drop(offered); // release the immutable borrow before upgrading below
     let chosen = match decision {

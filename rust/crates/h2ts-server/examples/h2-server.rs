@@ -32,7 +32,15 @@ async fn main() -> Result<()> {
     eprintln!("[h2-server] ws://{listen}  ->  in-process hyper HTTP/2 (h2c) service");
 
     loop {
-        let (socket, _peer) = listener.accept().await?;
+        // A transient accept error must not kill the listener — log and continue.
+        let (socket, _peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(err) => {
+                eprintln!("[h2-server] accept error: {err}");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue;
+            }
+        };
         tokio::spawn(async move {
             // Outer HTTP/1.1 connection carries the WebSocket handshake.
             let io = TokioIo::new(socket);

@@ -251,15 +251,20 @@ impl AsyncWrite for FailingPeer {
     }
 }
 
-/// A write failure while forwarding data to the peer tears the bridge down with an
-/// error, surfaced to `on_close` as 1006 carrying the io error text — the error
-/// path of the whole pump.
+/// A write failure while forwarding data to the peer/upstream tears the bridge
+/// down with the configured `error_close` (a distinct, informative close) rather
+/// than a bare 1006 — here a proxy-style 1014 Bad Gateway.
 #[tokio::test]
-async fn bridge_reports_1006_with_reason_on_peer_write_failure() {
+async fn bridge_reports_error_close_on_peer_write_failure() {
     let (client_io, server_io) = tokio::io::duplex(16 * 1024);
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CloseFrame>();
     let config = BridgeConfig {
+        // Proxy-style: an upstream failure is a Bad Gateway.
+        error_close: CloseFrame {
+            code: 1014,
+            reason: "bad gateway".to_string(),
+        },
         on_close: Some(Box::new(move |cf: &CloseFrame| {
             let _ = tx.send(cf.clone());
         })),
@@ -270,7 +275,7 @@ async fn bridge_reports_1006_with_reason_on_peer_write_failure() {
     });
 
     // Client sends data → the bridge decodes it and tries to write it to the peer,
-    // whose write fails → the bridge tears down with that error.
+    // whose write fails → the bridge tears down with the error close.
     let mut client_ws = WebSocket::after_handshake(client_io, Role::Client);
     client_ws
         .write_frame(Frame::binary(Payload::Owned(b"trigger".to_vec())))
@@ -281,10 +286,69 @@ async fn bridge_reports_1006_with_reason_on_peer_write_failure() {
         .recv()
         .await
         .expect("on_close should fire on write failure");
-    assert_eq!(got.code, 1006, "an errored teardown surfaces as abnormal");
-    assert!(
-        got.reason.contains("peer write failed"),
-        "the io error text is surfaced, got {:?}",
-        got.reason
-    );
+    assert_eq!(got.code, 1014, "a write failure uses error_close, not a bare 1006");
+    assert_eq!(got.reason, "bad gateway");
+}
+
+/// A peer/upstream whose read errors (a reset), so `peer_to_ws` hits its error arm.
+struct ReadErrPeer;
+
+impl AsyncRead for ReadErrPeer {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "upstream reset",
+        )))
+    }
+}
+
+impl AsyncWrite for ReadErrPeer {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(buf.len()))
+    }
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// A read error from the peer/upstream (a reset) tears down with `error_close`,
+/// distinct from the clean `close` a plain EOF uses.
+#[tokio::test]
+async fn bridge_reports_error_close_on_peer_read_error() {
+    let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CloseFrame>();
+    let config = BridgeConfig {
+        error_close: CloseFrame {
+            code: 1014,
+            reason: "bad gateway".to_string(),
+        },
+        keepalive: None,
+        on_close: Some(Box::new(move |cf: &CloseFrame| {
+            let _ = tx.send(cf.clone());
+        })),
+        ..Default::default()
+    };
+    tokio::spawn(async move {
+        let _ = bridge_with(server_io, ReadErrPeer, config).await;
+    });
+
+    // Keep the client side open (no data) so `peer_to_ws`'s immediate read error is
+    // the branch that ends the bridge, not a client EOF.
+    let _client_ws = WebSocket::after_handshake(client_io, Role::Client);
+
+    let got = rx.recv().await.expect("on_close should fire on read error");
+    assert_eq!(got.code, 1014, "a read error uses error_close, not the clean close");
+    assert_eq!(got.reason, "bad gateway");
 }

@@ -4,12 +4,14 @@
 //!
 //!   browser (h2ts) --ws--> [h2ts-proxy] --tcp--> upstream h2c server
 //!
-//! Usage: h2ts-proxy [listen_addr] [upstream_addr] [keepalive_secs] [--allow-implicit-codec]
-//!        defaults:   127.0.0.1:8091   127.0.0.1:8000   0 (off)      (off; require h2ts)
+//! Usage: h2ts-proxy [listen_addr] [upstream_addr] [keepalive_secs] [--no-keepalive] [--allow-implicit-codec]
+//!        defaults:   127.0.0.1:8091   127.0.0.1:8000   30/15 (on)   (keepalive on) (off; require h2ts)
 //!
-//! `keepalive_secs > 0` turns on server-initiated keepalive: the proxy pings an
-//! idle client every N seconds and closes it (1001 Going Away) if no response
-//! arrives within N more seconds.
+//! Server-initiated keepalive is **on by default** (ping an idle client every 30s,
+//! close it with 1001 Going Away if no response in a further 15s) so a silently-
+//! dead client can't leak the tunnel. Override the interval with a positive
+//! `keepalive_secs` (pong timeout equals the interval); pass `0` or
+//! `--no-keepalive` (anywhere on the command line) to turn it off.
 //!
 //! By default the proxy requires the `h2ts` subprotocol (rejecting others with a
 //! `400`). `--allow-implicit-codec` makes it a codec-agnostic byte tunnel that
@@ -19,7 +21,9 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use bytes::Bytes;
-use h2ts_server::{accept_with_options, bridge_with, AcceptOptions, BridgeConfig, KeepAlive};
+use h2ts_server::{
+    accept_with_options, bridge_with, AcceptOptions, BridgeConfig, CloseFrame, KeepAlive,
+};
 use http_body_util::Empty;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -32,10 +36,11 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
-    // `--allow-implicit-codec` may appear anywhere; the rest are positional.
+    // Flags may appear anywhere; the rest are positional.
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let allow_implicit_codec = args.iter().any(|a| a == "--allow-implicit-codec");
-    args.retain(|a| a != "--allow-implicit-codec");
+    let no_keepalive = args.iter().any(|a| a == "--no-keepalive");
+    args.retain(|a| a != "--allow-implicit-codec" && a != "--no-keepalive");
     let mut args = args.into_iter();
 
     let listen: SocketAddr = args
@@ -43,12 +48,21 @@ async fn main() -> Result<(), BoxError> {
         .unwrap_or_else(|| "127.0.0.1:8091".to_string())
         .parse()?;
     let upstream: String = args.next().unwrap_or_else(|| "127.0.0.1:8000".to_string());
-    // Optional 3rd positional: keepalive interval (and pong timeout) in seconds.
-    let keepalive: Option<KeepAlive> = args
-        .next()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&s| s > 0)
-        .map(|s| KeepAlive::new(Duration::from_secs(s), Duration::from_secs(s)));
+    // Keepalive is on by default. Opt out with `--no-keepalive` (or a `0` in the
+    // optional 3rd positional). A positive 3rd positional overrides the interval
+    // (with an equal pong timeout); otherwise the sensible default (30s/15s) is used.
+    let keepalive: Option<KeepAlive> = if no_keepalive {
+        None
+    } else {
+        match args.next() {
+            Some(s) => s
+                .parse::<u64>()
+                .ok()
+                .filter(|&s| s > 0)
+                .map(|s| KeepAlive::new(Duration::from_secs(s), Duration::from_secs(s))),
+            None => Some(KeepAlive::default()),
+        }
+    };
 
     let listener = TcpListener::bind(listen).await?;
     let ka = match &keepalive {
@@ -63,7 +77,16 @@ async fn main() -> Result<(), BoxError> {
     eprintln!("[h2ts-proxy] listening ws://{listen}  ->  tcp://{upstream} (h2c, {ka}, {codec})");
 
     loop {
-        let (socket, peer) = listener.accept().await?;
+        // A transient accept error (EMFILE/ENFILE/ECONNABORTED) must not kill the
+        // listener — log, back off briefly, and keep serving.
+        let (socket, peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(err) => {
+                eprintln!("[h2ts-proxy] accept error: {err}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
         let upstream = upstream.clone();
         let keepalive = keepalive.clone();
         tokio::spawn(async move {
@@ -126,6 +149,18 @@ async fn handle(
             Ok(tcp) => tcp,
             Err(err) => {
                 eprintln!("[h2ts-proxy] upstream connect failed ({upstream}): {err}");
+                // Tell the client the origin is unreachable with a 1014 Bad Gateway
+                // close (à la nginx 502) instead of dropping the WS as a bare 1006.
+                // An empty peer EOFs immediately, so the bridge just sends the close.
+                let cfg = BridgeConfig {
+                    close: CloseFrame {
+                        code: 1014,
+                        reason: "bad gateway".to_string(),
+                    },
+                    keepalive: None,
+                    ..Default::default()
+                };
+                let _ = bridge_with(ws, tokio::io::empty(), cfg).await;
                 return;
             }
         };
@@ -133,6 +168,12 @@ async fn handle(
 
         let config = BridgeConfig {
             keepalive,
+            // An upstream failure (reset/write error) closes the client with 1014
+            // Bad Gateway, distinct from a clean 1000 EOF.
+            error_close: CloseFrame {
+                code: 1014,
+                reason: "bad gateway".to_string(),
+            },
             // Surface why the tunnel closed (peer close, keepalive timeout, EOF).
             on_close: Some(Box::new(move |cf| {
                 eprintln!("[h2ts-proxy] closed ({peer}): {} {:?}", cf.code, cf.reason);
