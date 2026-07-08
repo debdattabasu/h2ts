@@ -11,7 +11,7 @@ use std::future::Future;
 use base64::Engine as _;
 use bytes::Bytes;
 use http::header::{
-    HeaderName, HeaderValue, CONNECTION, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY,
+    HeaderName, HeaderValue, CONNECTION, ORIGIN, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY,
     SEC_WEBSOCKET_PROTOCOL, UPGRADE,
 };
 use http_body_util::Empty;
@@ -29,7 +29,7 @@ pub const DEFAULT_SUBPROTOCOL: &str = "h2ts";
 
 /// Options controlling how the handshake picks a subprotocol to echo when the
 /// handler's selector declines (see [`accept_with_options`]).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct AcceptOptions {
     /// When the selector returns `None` and the client did **not** offer
     /// [`DEFAULT_SUBPROTOCOL`] (`h2ts`), accept the client's first offered
@@ -42,6 +42,16 @@ pub struct AcceptOptions {
     /// codec-agnostic tunnel that accepts whatever framing the client offered
     /// (e.g. a raw/binary tunnel, or a websockify-style `binary` client).
     pub allow_implicit_codec: bool,
+    /// Opt-in `Origin` allowlist (Cross-Site WebSocket Hijacking defence). When
+    /// `Some`, only handshakes whose `Origin` header matches one of these entries
+    /// (ASCII case-insensitive, e.g. `https://app.example.com`) are accepted;
+    /// everything else — including a *missing* `Origin` — is rejected with a `403`
+    /// ([`WebSocketError::ForbiddenOrigin`]).
+    ///
+    /// `None` (the default) accepts any origin. This mirrors nginx, which does no
+    /// `Origin` validation by default and leaves it as an opt-in allowlist; a
+    /// browser always sends `Origin`, so a legitimate browser client is unaffected.
+    pub allowed_origins: Option<Vec<String>>,
 }
 
 /// The upgraded WebSocket connection, presented as a raw tokio byte stream
@@ -60,6 +70,10 @@ pub enum WebSocketError {
     /// [`AcceptOptions::allow_implicit_codec`] was off. Reject it with a `400`
     /// (see [`WebSocketError::rejection_response`]).
     UnsupportedSubprotocol,
+    /// The request's `Origin` is not in the configured
+    /// [`AcceptOptions::allowed_origins`] allowlist (or is missing). Reject it
+    /// with a `403` (CSWSH defence).
+    ForbiddenOrigin,
     /// hyper failed to upgrade the connection after the `101` was sent.
     Upgrade(hyper::Error),
 }
@@ -82,6 +96,7 @@ impl WebSocketError {
         let status = match self {
             WebSocketError::NotUpgradeRequest => StatusCode::UPGRADE_REQUIRED,
             WebSocketError::UnsupportedSubprotocol => StatusCode::BAD_REQUEST,
+            WebSocketError::ForbiddenOrigin => StatusCode::FORBIDDEN,
             WebSocketError::Upgrade(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Response::builder()
@@ -98,6 +113,7 @@ impl fmt::Display for WebSocketError {
             WebSocketError::UnsupportedSubprotocol => {
                 f.write_str("client offered no supported subprotocol")
             }
+            WebSocketError::ForbiddenOrigin => f.write_str("origin not allowed"),
             WebSocketError::Upgrade(e) => write!(f, "WebSocket upgrade failed: {e}"),
         }
     }
@@ -107,7 +123,9 @@ impl std::error::Error for WebSocketError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             WebSocketError::Upgrade(e) => Some(e),
-            WebSocketError::NotUpgradeRequest | WebSocketError::UnsupportedSubprotocol => None,
+            WebSocketError::NotUpgradeRequest
+            | WebSocketError::UnsupportedSubprotocol
+            | WebSocketError::ForbiddenOrigin => None,
         }
     }
 }
@@ -226,6 +244,16 @@ where
 {
     if !is_upgrade_request(request) {
         return Err(WebSocketError::NotUpgradeRequest);
+    }
+
+    // Opt-in Origin allowlist (CSWSH defence). Off by default (nginx-style): only
+    // enforced when the caller configured `allowed_origins`.
+    if let Some(allowed) = &options.allowed_origins {
+        let origin = request.headers().get(ORIGIN).and_then(|v| v.to_str().ok());
+        let ok = origin.is_some_and(|o| allowed.iter().any(|a| a.eq_ignore_ascii_case(o)));
+        if !ok {
+            return Err(WebSocketError::ForbiddenOrigin);
+        }
     }
     // Present because `is_upgrade_request` checked for it.
     let key = request

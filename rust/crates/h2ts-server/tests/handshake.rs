@@ -9,7 +9,7 @@ use h2ts_server::{
     WebSocketError,
 };
 use http::header::{
-    CONNECTION, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_PROTOCOL, UPGRADE,
+    CONNECTION, ORIGIN, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_PROTOCOL, UPGRADE,
 };
 use hyper::{Request, StatusCode};
 
@@ -41,6 +41,7 @@ fn fallback(offer: Option<&str>, allow_implicit_codec: bool) -> Option<Option<St
     let mut req = upgrade_request(offer);
     let opts = AcceptOptions {
         allow_implicit_codec,
+        ..Default::default()
     };
     match accept_with_options(&mut req, |_| None, opts) {
         Ok((resp, _fut)) => {
@@ -180,6 +181,62 @@ fn accept_with_honors_a_selection_even_without_h2ts() {
     );
 }
 
+/// A valid h2ts upgrade request with an optional `Origin` header.
+fn upgrade_with_origin(origin: Option<&str>) -> Request<()> {
+    let mut b = Request::builder()
+        .header(UPGRADE, "websocket")
+        .header(CONNECTION, "Upgrade")
+        .header(SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==")
+        .header(SEC_WEBSOCKET_PROTOCOL, "h2ts");
+    if let Some(o) = origin {
+        b = b.header(ORIGIN, o);
+    }
+    b.body(()).unwrap()
+}
+
+fn origin_opts() -> AcceptOptions {
+    AcceptOptions {
+        allowed_origins: Some(vec!["https://app.example.com".into()]),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn allowed_origins_accepts_a_listed_origin() {
+    // A listed origin (matched ASCII case-insensitively) completes the handshake.
+    let mut req = upgrade_with_origin(Some("https://APP.example.com"));
+    let (resp, _fut) = accept_with_options(&mut req, |_| None, origin_opts()).unwrap();
+    assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
+}
+
+#[test]
+fn allowed_origins_rejects_an_unlisted_origin_with_403() {
+    let mut req = upgrade_with_origin(Some("https://evil.example.com"));
+    let err = accept_with_options(&mut req, |_| None, origin_opts())
+        .err()
+        .expect("an unlisted origin must be rejected");
+    assert!(matches!(err, WebSocketError::ForbiddenOrigin));
+    assert_eq!(err.rejection_response().status(), StatusCode::FORBIDDEN);
+}
+
+#[test]
+fn allowed_origins_rejects_a_missing_origin() {
+    // With an allowlist set, a request with no Origin is rejected too.
+    let mut req = upgrade_with_origin(None);
+    let err = accept_with_options(&mut req, |_| None, origin_opts())
+        .err()
+        .expect("a missing origin must be rejected when an allowlist is set");
+    assert!(matches!(err, WebSocketError::ForbiddenOrigin));
+}
+
+#[test]
+fn no_allowlist_accepts_any_origin() {
+    // The default (no allowlist) is permissive — like nginx — so any origin works.
+    let mut req = upgrade_with_origin(Some("https://anything.example.com"));
+    let (resp, _fut) = accept(&mut req).unwrap();
+    assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
+}
+
 #[test]
 fn accept_with_never_echoes_an_unoffered_subprotocol() {
     // A misbehaving handler returns a subprotocol the client did NOT offer. The
@@ -204,10 +261,11 @@ fn accept_with_never_echoes_an_unoffered_subprotocol() {
 fn allow_implicit_codec_accepts_the_first_offered_codec() {
     let opts = AcceptOptions {
         allow_implicit_codec: true,
+        ..Default::default()
     };
     // Unknown codec: accepted, first offered echoed.
     let mut req = upgrade_request(Some("mystery, other"));
-    let (resp, _fut) = accept_with_options(&mut req, |_| None, opts).unwrap();
+    let (resp, _fut) = accept_with_options(&mut req, |_| None, opts.clone()).unwrap();
     assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
     assert_eq!(
         resp.headers().get(SEC_WEBSOCKET_PROTOCOL).unwrap(),

@@ -156,6 +156,7 @@ async fn allow_implicit_codec_accepts_any_offered_codec() {
             |_offered| None,
             AcceptOptions {
                 allow_implicit_codec: true,
+                ..Default::default()
             },
         ) {
             Ok(pair) => pair,

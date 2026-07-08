@@ -17,6 +17,10 @@
 //! `400`). `--allow-implicit-codec` makes it a codec-agnostic byte tunnel that
 //! accepts whatever subprotocol the client offers (websockify-style `binary`,
 //! none, …) — the flag may appear anywhere on the command line.
+//!
+//! `Origin` is **not** checked by default (like nginx). Pass `--allowed-origin
+//! <origin>` (repeatable) to enforce a CSWSH allowlist — only those origins are
+//! accepted, everything else gets a `403`.
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -37,11 +41,27 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
     // Flags may appear anywhere; the rest are positional.
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let allow_implicit_codec = args.iter().any(|a| a == "--allow-implicit-codec");
-    let no_keepalive = args.iter().any(|a| a == "--no-keepalive");
-    args.retain(|a| a != "--allow-implicit-codec" && a != "--no-keepalive");
-    let mut args = args.into_iter();
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let allow_implicit_codec = raw.iter().any(|a| a == "--allow-implicit-codec");
+    let no_keepalive = raw.iter().any(|a| a == "--no-keepalive");
+    // `--allowed-origin <origin>` is repeatable and takes a value; collect them,
+    // dropping both the flag and its value from the positional args.
+    let mut allowed_origins: Vec<String> = Vec::new();
+    let mut positional: Vec<String> = Vec::new();
+    let mut it = raw.into_iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--allow-implicit-codec" | "--no-keepalive" => {}
+            "--allowed-origin" => {
+                if let Some(v) = it.next() {
+                    allowed_origins.push(v);
+                }
+            }
+            _ => positional.push(a),
+        }
+    }
+    let allowed_origins = (!allowed_origins.is_empty()).then_some(allowed_origins);
+    let mut args = positional.into_iter();
 
     let listen: SocketAddr = args
         .next()
@@ -74,7 +94,13 @@ async fn main() -> Result<(), BoxError> {
     } else {
         "h2ts only"
     };
-    eprintln!("[h2ts-proxy] listening ws://{listen}  ->  tcp://{upstream} (h2c, {ka}, {codec})");
+    let origins = match &allowed_origins {
+        Some(o) => format!("origins [{}]", o.join(", ")),
+        None => "any origin".to_string(),
+    };
+    eprintln!(
+        "[h2ts-proxy] listening ws://{listen}  ->  tcp://{upstream} (h2c, {ka}, {codec}, {origins})"
+    );
 
     loop {
         // A transient accept error (EMFILE/ENFILE/ECONNABORTED) must not kill the
@@ -89,6 +115,7 @@ async fn main() -> Result<(), BoxError> {
         };
         let upstream = upstream.clone();
         let keepalive = keepalive.clone();
+        let allowed_origins = allowed_origins.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(socket);
             let service = service_fn(move |req| {
@@ -98,6 +125,7 @@ async fn main() -> Result<(), BoxError> {
                     peer,
                     keepalive.clone(),
                     allow_implicit_codec,
+                    allowed_origins.clone(),
                 )
             });
             if let Err(err) = http1::Builder::new()
@@ -117,6 +145,7 @@ async fn handle(
     peer: SocketAddr,
     keepalive: Option<KeepAlive>,
     allow_implicit_codec: bool,
+    allowed_origins: Option<Vec<String>>,
 ) -> Result<Response<Empty<Bytes>>, BoxError> {
     // Require h2ts by default; `--allow-implicit-codec` makes this a codec-agnostic
     // tunnel that accepts whatever subprotocol the client offers (websockify-style
@@ -127,6 +156,7 @@ async fn handle(
         |_offered| None,
         AcceptOptions {
             allow_implicit_codec,
+            allowed_origins,
         },
     ) {
         Ok(pair) => pair,
