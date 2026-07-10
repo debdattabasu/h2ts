@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -166,6 +167,30 @@ func TestHandshakeImplicitCodec(t *testing.T) {
 	cli.Conn.Close()
 	if code != 101 || hdr.Get("Sec-WebSocket-Protocol") != "h2ts" {
 		t.Fatalf("implicit codec with h2ts: proto %q, want h2ts", hdr.Get("Sec-WebSocket-Protocol"))
+	}
+}
+
+// TestAcceptNonHijackable: a ResponseWriter that can't be hijacked (e.g. an
+// HTTP/2 request, or httptest.ResponseRecorder) is rejected with 500 — the
+// gateway must run over HTTP/1.1.
+func TestAcceptNonHijackable(t *testing.T) {
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	req.Header.Set("Sec-WebSocket-Protocol", "h2ts")
+
+	rec := httptest.NewRecorder() // does not implement http.Hijacker
+	conn, err := Accept(rec, req)
+	if conn != nil || err == nil {
+		t.Fatalf("expected failure on a non-hijackable ResponseWriter, got conn=%v err=%v", conn, err)
+	}
+	var he *HandshakeError
+	if !errors.As(err, &he) || he.Status != http.StatusInternalServerError {
+		t.Fatalf("err = %v, want a 500 HandshakeError", err)
+	}
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("written status = %d, want 500", rec.Code)
 	}
 }
 

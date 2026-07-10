@@ -56,6 +56,11 @@ type ServeConfig struct {
 	// Server, if set, is the h2c server used to serve the connection — set it to
 	// customize HTTP/2 settings (max concurrent streams, frame size, …). A fresh
 	// &http2.Server{} is used otherwise.
+	//
+	// Set its WriteByteTimeout to bound a write to a client that has stopped
+	// reading: keepalive can't detect that case (its ping shares the write path
+	// with the stalled data write), so without a write timeout such a connection
+	// lingers until the OS TCP timeout. Off by default (see doc/StatusJul10.md §1).
 	Server *http2.Server
 }
 

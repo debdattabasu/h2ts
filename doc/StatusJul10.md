@@ -143,7 +143,32 @@ flow-control guarantees above.
   - `TestKeepAliveUsesCustomCloseFrame` — a custom `KeepAlive.Close` (4020 "custom-bye") is
     the frame the peer receives and the surfaced `CloseReason`.
   - Test frame builder generalized (`clientFrameFin`) to construct fragmented/partial frames.
-- [ ] **P3** — remaining edges + `WriteByteTimeout` decision.
+- [x] **P3** — _done 2026-07-10._ Edge tests + the `WriteByteTimeout` decision:
+  - `TestConnSkipsEmptyDataFrame` — a zero-length data frame contributes nothing, no
+    spurious EOF.
+  - `TestConnEmptyCloseIsNoStatus` — an empty Close → 1005, echoed as an empty close.
+  - `TestConnEmptyWriteIsNoop` — `Write(nil)` writes nothing, no error.
+  - `TestAcceptNonHijackable` — a non-hijackable `ResponseWriter` → 500 `HandshakeError`.
+  - `TestServeH2CustomServer` — the `ServeConfig.Server` path serves end to end.
+  - **`WriteByteTimeout` — decided: don't default it; document + recommend the knob.**
+    Rationale: (1) _parity_ — the Rust server has no equivalent and also falls back to the
+    OS TCP timeout for "client dies mid-write," so not defaulting keeps the two servers
+    consistent; (2) _least surprise_ — a blanket write timeout can tear down a legitimately
+    slow-but-alive download, and the right value is deployment-specific; (3) the knob
+    already exists (`ServeConfig.Server = &http2.Server{WriteByteTimeout: …}`) and is now
+    pointed to from the `ServeConfig.Server` doc comment. Flipping to a default (tied to
+    keepalive) is a one-line change if we later want Go to exceed the shared baseline.
 
-Suite: **30 tests + subtests, green under `-race`**; conformance still passes under both
+Suite: **35 tests + subtests, green under `-race`**; conformance still passes under both
 clients (`GATEWAY=go`).
+
+## Remaining / not pursued
+
+- **Defaulting `WriteByteTimeout`** — deliberately deferred (see P3); opt-in via
+  `ServeConfig.Server` for now.
+- **Enforcement-level custom-server test** (e.g. the 6th concurrent stream is refused when
+  `MaxConcurrentStreams: 5`) — `TestServeH2CustomServer` only exercises the path; asserting
+  the *setting takes effect* needs concurrent long-lived streams. Low value; skipped.
+- **`Upgrade`-failure (post-101) arm** — like the Rust server's 500 `Upgrade(_)` case, this
+  is only reachable through a live post-handshake transport failure and isn't
+  unit-constructible; left uncovered.

@@ -532,6 +532,44 @@ func TestKeepAliveUsesCustomCloseFrame(t *testing.T) {
 	}
 }
 
+// TestConnSkipsEmptyDataFrame: a zero-length data frame contributes no bytes and
+// is skipped without an error or a spurious EOF.
+func TestConnSkipsEmptyDataFrame(t *testing.T) {
+	inbound := append(clientFrame(opBinary, nil), clientFrame(opBinary, []byte("x"))...)
+	c, _ := connOver(inbound)
+	buf := make([]byte, 8)
+	if n, err := c.Read(buf); err != nil || string(buf[:n]) != "x" {
+		t.Fatalf("read after empty frame = %q, %v", buf[:n], err)
+	}
+}
+
+// TestConnEmptyCloseIsNoStatus: a Close with no payload surfaces as 1005 (no
+// status received) and is echoed as an empty close (1005 is not sendable).
+func TestConnEmptyCloseIsNoStatus(t *testing.T) {
+	c, f := connOver(clientFrame(opClose, nil))
+	if _, err := c.Read(make([]byte, 8)); err != io.EOF {
+		t.Fatalf("read after empty close = %v, want io.EOF", err)
+	}
+	if r := c.CloseReason(); r.Code != closeNoStatus {
+		t.Fatalf("CloseReason code = %d, want %d (no status)", r.Code, closeNoStatus)
+	}
+	op, payload, _ := serverFrame(t, f.out.Bytes())
+	if op != opClose || len(payload) != 0 {
+		t.Fatalf("echo = op 0x%x with %d-byte payload, want an empty close", op, len(payload))
+	}
+}
+
+// TestConnEmptyWriteIsNoop: Write(nil) writes nothing and reports no error.
+func TestConnEmptyWriteIsNoop(t *testing.T) {
+	c, f := connOver(nil)
+	if n, err := c.Write(nil); n != 0 || err != nil {
+		t.Fatalf("Write(nil) = %d, %v", n, err)
+	}
+	if f.out.Len() != 0 {
+		t.Fatalf("empty Write emitted %d bytes", f.out.Len())
+	}
+}
+
 // readerOf adapts Conn.Read to an io.Reader that stops after total bytes.
 func readerOf(c *Conn, total int) io.Reader { return io.LimitReader(c, int64(total)) }
 

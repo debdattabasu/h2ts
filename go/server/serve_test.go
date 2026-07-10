@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/net/http2"
 )
 
 // testRoutes is a slice of the conformance origin: enough to exercise the h2
@@ -315,6 +317,23 @@ func TestServeH2ControlFramesDoNotCorruptData(t *testing.T) {
 	}
 	close(stop)
 	pinger.Wait()
+}
+
+// TestServeH2CustomServer exercises the ServeConfig.Server path (a caller-supplied
+// http2.Server, e.g. with custom settings) end to end.
+func TestServeH2CustomServer(t *testing.T) {
+	cfg := ServeConfig{Server: &http2.Server{MaxConcurrentStreams: 5}}
+	addr := startGateway(t, testRoutes(), AcceptOptions{}, cfg)
+	tunnel, _ := wsDial(t, addr, "/", DefaultSubprotocol)
+	defer tunnel.Close()
+	cc := dialH2(t, tunnel)
+	resp := h2do(t, cc, "GET", "/hello", nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("GET /hello over a custom server = %d", resp.StatusCode)
+	}
+	if body := readBody(t, resp); body != "hi" {
+		t.Fatalf("body = %q, want hi", body)
+	}
 }
 
 func readBody(t *testing.T, resp *http.Response) string {
