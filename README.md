@@ -16,8 +16,8 @@ It's a monorepo of **native, per-language implementations**. They share **no cod
 
 | | Client (frontend) | Server (gateway) |
 |---|---|---|
-| **TypeScript** | [`h2ts`](typescript/client) — the ~9 KB, zero-dep browser/Node client · *npm* | [`@h2ts/server`](typescript/server) · *planned* |
-| **Rust** | [`h2ts-client`](rust/crates/h2ts-client) — for WASM frontends (Leptos/Yew/Dioxus), no hyper/tokio · *crates.io · scaffold* | [`h2ts-server`](rust/crates/h2ts-server) — hyper/axum/tower + the `h2ts-proxy` binary · *[crates.io](https://crates.io/crates/h2ts-server)* |
+| **TypeScript** | [`@debdattabasu/h2ts`](https://www.npmjs.com/package/@debdattabasu/h2ts) — the ~9 KB, zero-dep browser/Node client · *[npm](https://www.npmjs.com/package/@debdattabasu/h2ts)* | [`@h2ts/server`](typescript/server) · *planned* |
+| **Rust** | [`h2ts-client`](https://crates.io/crates/h2ts-client) — for WASM frontends (Leptos/Yew/Dioxus), no hyper/tokio · *[crates.io](https://crates.io/crates/h2ts-client)* | [`h2ts-server`](https://crates.io/crates/h2ts-server) — hyper/axum/tower + the `h2ts-proxy` binary · *[crates.io](https://crates.io/crates/h2ts-server)* |
 | **Go** | — | [`.../h2ts/go`](go) · *planned* |
 
 Shared: [`spec/protocol.md`](spec/protocol.md) (the wire contract) · [`conformance/`](conformance) (cross-stack e2e) · [`wslay-sys`](rust/crates/wslay-sys) (wslay FFI — powers the Rust server's sub-frame streaming, [crates.io](https://crates.io/crates/wslay-sys)).
@@ -52,7 +52,7 @@ h2ts/
 │   └── server/                 #   @h2ts/server (planned)
 ├── rust/                       # Cargo workspace
 │   └── crates/
-│       ├── h2ts-client/        #   Rust client for WASM frontends (scaffold)
+│       ├── h2ts-client/        #   Rust client for WASM frontends
 │       ├── h2ts-server/        #   server library + h2ts-proxy binary
 │       └── wslay-sys/          #   wslay FFI framing backend
 ├── go/                         # Go module (planned)
@@ -70,10 +70,10 @@ make conformance   # cross-stack e2e (builds the client, starts origin + proxy, 
 
 # or per stack:
 cd rust && cargo test
-cd typescript && npm install && npm test -w h2ts
+cd typescript && npm install && npm test -w client
 ```
 
-The conformance suite runs a fixed battery — routing, JSON, byte-exact uploads/downloads, concurrent multiplexed streams, streaming reads, ping, 404 — and passes identically against the Rust proxy (`h2ts-proxy`) and the in-process `serve_h2` (`h2-server` example). Per-package usage lives in each package's README: [`h2ts` client](typescript/client), [`h2ts-server`](rust/crates/h2ts-server), [`h2ts-client`](rust/crates/h2ts-client).
+The conformance suite runs a fixed battery — routing, JSON, byte-exact uploads/downloads, concurrent multiplexed streams, streaming reads, ping, 404 — and passes identically against the Rust proxy (`h2ts-proxy`) and the in-process `serve_h2` (`h2-server` example). Per-package usage lives in each package's README: [`@debdattabasu/h2ts` client](typescript/client), [`h2ts-server`](rust/crates/h2ts-server), [`h2ts-client`](rust/crates/h2ts-client).
 
 ## Roadmap
 
@@ -81,8 +81,8 @@ The conformance suite runs a fixed battery — routing, JSON, byte-exact uploads
 - [x] Rust server `h2ts-server` — `accept`, `bridge`, `WsByteStream`, `serve_h2`, the `h2ts-proxy` binary, and `wslay` sub-frame streaming (via `wslay-sys`)
 - [x] Publish [`h2ts-server`](https://crates.io/crates/h2ts-server) + [`wslay-sys`](https://crates.io/crates/wslay-sys) to crates.io
 - [x] Monorepo restructure: one wire spec + conformance suite across languages
-- [ ] **`h2ts-client` (Rust)** — port the TS engine to a `wasm32`, no-hyper client for Rust frontends *(scaffolded)*
-- [ ] Publish `h2ts` client to npm
+- [x] **`h2ts-client` (Rust)** — a `wasm32`, no-hyper client for Rust frontends, [published to crates.io](https://crates.io/crates/h2ts-client)
+- [x] Publish the [`@debdattabasu/h2ts`](https://www.npmjs.com/package/@debdattabasu/h2ts) client to npm
 - [ ] **Go server** — terminate the tunnel and serve/proxy HTTP/2 in Go *(scaffolded)*
 - [ ] **Node.js server** (`@h2ts/server`) — serve a `node:http2` service over the tunnel *(scaffolded)*
 - [ ] **Envoy filter** — terminate the WebSocket tunnel as an Envoy HTTP filter, to run the gateway inside an existing Envoy/proxy mesh
