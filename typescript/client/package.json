@@ -1,5 +1,5 @@
 {
-  "name": "h2ts",
+  "name": "@debdattabasu/h2ts",
   "version": "0.1.0",
   "description": "A tiny HTTP/2 client for the browser, tunneled over a WebSocket (or any byte duplex). Idiomatic TypeScript, no Node core deps.",
   "type": "module",

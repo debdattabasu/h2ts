@@ -16,13 +16,13 @@ Browsers can't open raw TCP sockets or speak HTTP/2 with prior knowledge. `h2ts`
 ## Install
 
 ```bash
-npm install h2ts
+npm install @debdattabasu/h2ts
 ```
 
 ## Usage
 
 ```ts
-import { connectWebSocket } from "h2ts";
+import { connectWebSocket } from "@debdattabasu/h2ts";
 
 // Open the WebSocket and start an HTTP/2 client over it. The `h2ts` subprotocol
 // is offered by default; append your own via `{ protocols: [...] }`.
@@ -51,7 +51,7 @@ Already have a byte-duplex `Transport` (a non-WebSocket tunnel)? Use `connect(tr
 
 This is the TypeScript client — one of three implementations in the [h2ts monorepo](https://github.com/debdattabasu/h2ts), all sharing a single wire spec and conformance suite:
 
-- **This package (`h2ts`)** — the browser/Node client, in TypeScript.
+- **This package (`@debdattabasu/h2ts`)** — the browser/Node client, in TypeScript.
 - **Rust backend — [`h2ts-server`](https://crates.io/crates/h2ts-server)** — makes a WebSocket look like raw TCP and serves or proxies HTTP/2 over it; ships the `h2ts-proxy` binary (a drop-in `websockify`).
 - **Rust frontend — [`h2ts-client`](https://github.com/debdattabasu/h2ts/tree/main/rust/crates/h2ts-client)** — the same client for Rust/WASM frontends (no `hyper`, no `tokio`), behavior-mirrored against this one by the shared conformance battery.
 
