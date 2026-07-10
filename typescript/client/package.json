@@ -4,12 +4,33 @@
   "description": "A tiny HTTP/2 client for the browser, tunneled over a WebSocket (or any byte duplex). Idiomatic TypeScript, no Node core deps.",
   "type": "module",
   "license": "MIT",
+  "author": "Debdatta Basu",
+  "homepage": "https://github.com/debdattabasu/h2ts/tree/main/typescript/client#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/debdattabasu/h2ts.git",
+    "url": "git+https://github.com/debdattabasu/h2ts.git",
     "directory": "typescript/client"
   },
+  "bugs": {
+    "url": "https://github.com/debdattabasu/h2ts/issues"
+  },
+  "keywords": [
+    "http2",
+    "http/2",
+    "hpack",
+    "websocket",
+    "tunnel",
+    "browser",
+    "client",
+    "streaming",
+    "grpc",
+    "rfc7540",
+    "rfc7541"
+  ],
   "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -19,7 +40,12 @@
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist/index.js",
+    "dist/index.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsup",
     "typecheck": "tsc --noEmit",

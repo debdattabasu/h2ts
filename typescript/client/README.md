@@ -49,7 +49,13 @@ Already have a byte-duplex `Transport` (a non-WebSocket tunnel)? Use `connect(tr
 
 ## Part of h2ts
 
-This is the TypeScript client. The [h2ts monorepo](https://github.com/debdattabasu/h2ts) also has the Rust server ([`h2ts-server`](https://crates.io/crates/h2ts-server), + the `h2ts-proxy` binary) and a native Rust client for WASM frontends. All implementations share one wire spec and conformance suite.
+This is the TypeScript client — one of three implementations in the [h2ts monorepo](https://github.com/debdattabasu/h2ts), all sharing a single wire spec and conformance suite:
+
+- **This package (`h2ts`)** — the browser/Node client, in TypeScript.
+- **Rust backend — [`h2ts-server`](https://crates.io/crates/h2ts-server)** — makes a WebSocket look like raw TCP and serves or proxies HTTP/2 over it; ships the `h2ts-proxy` binary (a drop-in `websockify`).
+- **Rust frontend — [`h2ts-client`](https://github.com/debdattabasu/h2ts/tree/main/rust/crates/h2ts-client)** — the same client for Rust/WASM frontends (no `hyper`, no `tokio`), behavior-mirrored against this one by the shared conformance battery.
+
+Point `h2ts` at any HTTP/2 server by terminating the WebSocket with `h2ts-server` / `h2ts-proxy` (or `websockify`).
 
 ## License
 
