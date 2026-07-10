@@ -6,6 +6,9 @@ dist/
 /rust/target/
 *.tsbuildinfo
 
+# Go build output (conformance builds the serve gateway here)
+/go/bin/
+
 # Test coverage
 /coverage/
 

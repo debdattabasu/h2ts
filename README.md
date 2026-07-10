@@ -18,7 +18,7 @@ It's a monorepo of **native, per-language implementations**. They share **no cod
 |---|---|---|
 | **TypeScript** | [`@debdattabasu/h2ts`](https://www.npmjs.com/package/@debdattabasu/h2ts) — the ~9 KB, zero-dep browser/Node client · *[npm](https://www.npmjs.com/package/@debdattabasu/h2ts)* | [`@h2ts/server`](typescript/server) · *planned* |
 | **Rust** | [`h2ts-client`](https://crates.io/crates/h2ts-client) — for WASM frontends (Leptos/Yew/Dioxus), no hyper/tokio · *[crates.io](https://crates.io/crates/h2ts-client)* | [`h2ts-server`](https://crates.io/crates/h2ts-server) — hyper/axum/tower + the `h2ts-proxy` binary · *[crates.io](https://crates.io/crates/h2ts-server)* |
-| **Go** | — | [`.../h2ts/go`](go) · *planned* |
+| **Go** | — | [`.../h2ts/go`](go) — any `net/http` handler served as h2c over the tunnel (in-process serve shape) |
 
 Shared: [`spec/protocol.md`](spec/protocol.md) (the wire contract) · [`conformance/`](conformance) (cross-stack e2e) · [`wslay-sys`](rust/crates/wslay-sys) (wslay FFI — powers the Rust server's sub-frame streaming, [crates.io](https://crates.io/crates/wslay-sys)).
 
@@ -55,8 +55,9 @@ h2ts/
 │       ├── h2ts-client/        #   Rust client for WASM frontends
 │       ├── h2ts-server/        #   server library + h2ts-proxy binary
 │       └── wslay-sys/          #   wslay FFI framing backend
-├── go/                         # Go module (planned)
-│   └── server/
+├── go/                         # Go module
+│   ├── server/                 #   Accept + ServeH2 (h2c served over the tunnel)
+│   └── examples/h2-server/     #   runnable serve gateway (conformance routes)
 └── Makefile                    # top-level tasks (fan out to each stack)
 ```
 
@@ -65,15 +66,17 @@ h2ts/
 The top-level `Makefile` fans out across every stack; or drive each directly.
 
 ```bash
-make test          # everything: rust + typescript + conformance
-make conformance   # cross-stack e2e (builds the client, starts origin + proxy, runs checks)
+make test             # everything: rust + typescript + go + conformance
+make conformance      # cross-stack e2e (client -> h2ts-proxy -> h2c origin)
+make conformance-go   # same battery, but against the Go serve gateway
 
 # or per stack:
 cd rust && cargo test
 cd typescript && npm install && npm test -w client
+cd go && go test ./...
 ```
 
-The conformance suite runs a fixed battery — routing, JSON, byte-exact uploads/downloads, concurrent multiplexed streams, streaming reads, ping, 404 — and passes identically against the Rust proxy (`h2ts-proxy`) and the in-process `serve_h2` (`h2-server` example). Per-package usage lives in each package's README: [`@debdattabasu/h2ts` client](typescript/client), [`h2ts-server`](rust/crates/h2ts-server), [`h2ts-client`](rust/crates/h2ts-client).
+The conformance suite runs a fixed battery — routing, JSON, byte-exact uploads/downloads, concurrent multiplexed streams, streaming reads, ping, trailers, 1xx early hints, 404 — and passes identically across gateways, selected by `GATEWAY`: the Rust proxy (`h2ts-proxy`, default), the in-process Rust `serve_h2` (`h2-server` example), and the Go `ServeH2` gateway (`GATEWAY=go`) — each driven by both the TypeScript and Rust clients. Per-package usage lives in each package's README: [`@debdattabasu/h2ts` client](typescript/client), [`h2ts-server`](rust/crates/h2ts-server), [`h2ts-client`](rust/crates/h2ts-client), [Go server](go).
 
 ## Roadmap
 
@@ -83,7 +86,7 @@ The conformance suite runs a fixed battery — routing, JSON, byte-exact uploads
 - [x] Monorepo restructure: one wire spec + conformance suite across languages
 - [x] **`h2ts-client` (Rust)** — a `wasm32`, no-hyper client for Rust frontends, [published to crates.io](https://crates.io/crates/h2ts-client)
 - [x] Publish the [`@debdattabasu/h2ts`](https://www.npmjs.com/package/@debdattabasu/h2ts) client to npm
-- [ ] **Go server** — terminate the tunnel and serve/proxy HTTP/2 in Go *(scaffolded)*
+- [x] **Go server** — `Accept` + `ServeH2` serve any `net/http` handler as h2c over the tunnel (in-process serve shape; the proxy stays the single Rust `h2ts-proxy`). Pure-Go RFC 6455 framing; passes conformance under both clients ([`go/`](go))
 - [ ] **Node.js server** (`@h2ts/server`) — serve a `node:http2` service over the tunnel *(scaffolded)*
 - [ ] **Envoy filter** — terminate the WebSocket tunnel as an Envoy HTTP filter, to run the gateway inside an existing Envoy/proxy mesh
 

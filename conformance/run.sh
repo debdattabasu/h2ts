@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Run the conformance suite against the default stack:
-#   client(s) --ws--> h2ts-proxy --tcp--> Node h2c origin
+# Run the conformance suite against a gateway. Two gateways are selectable via
+# GATEWAY (both are behavior-mirrored by this same battery):
+#   proxy (default) — Rust h2ts-proxy --tcp--> Node h2c origin (forwards raw bytes)
+#   go              — the Go serve_h2 gateway (examples/h2-server, in-process h2c)
 # Builds what it needs, starts the stack, runs the checks, tears down.
 #
-# By default BOTH clients run against the same proxy (the TypeScript `h2ts` and
-# the Rust `h2ts-client`, native transport). CLIENT selects which:
+# By default BOTH clients run against the gateway (the TypeScript `h2ts` and the
+# Rust `h2ts-client`, native transport). CLIENT selects which:
 #   ts | rust | wasm | both (=ts+rust, default) | all (=ts+rust+wasm)
 # `wasm` compiles the Rust client to wasm32 and drives its REAL browser WebSocket
 # transport (src/web.rs) under Node — needs the wasm32 target + wasm-bindgen CLI.
@@ -19,7 +21,7 @@ run_wasm() { [ "$CLIENT" = "wasm" ] || [ "$CLIENT" = "all" ]; }
 
 if run_ts; then
   echo "==> building the TypeScript client"
-  ( cd typescript && npm install --silent && npm run build -w h2ts --silent )
+  ( cd typescript && npm install --silent && npm run build -w @debdattabasu/h2ts --silent )
 fi
 
 if run_rust; then
@@ -42,21 +44,42 @@ if run_wasm; then
     rust/target/wasm32-unknown-unknown/debug/h2ts_wasm_conformance.wasm
 fi
 
-echo "==> building h2ts-proxy"
-( cd rust && cargo build --quiet -p h2ts-server --bin h2ts-proxy )
-
-# The h2c origin port (override if :8000 is taken locally); the proxy forwards here.
-ORIGIN_PORT="${ORIGIN_PORT:-8000}"
-echo "==> starting origin (:$ORIGIN_PORT) and h2ts-proxy (:8091 -> :$ORIGIN_PORT)"
-ORIGIN_PORT="$ORIGIN_PORT" node conformance/origin.mjs & ORIGIN=$!
-rust/target/debug/h2ts-proxy 127.0.0.1:8091 "127.0.0.1:$ORIGIN_PORT" & PROXY=$!
-cleanup() { kill "$ORIGIN" "$PROXY" 2>/dev/null || true; }
+# Bring up the selected gateway; each sets GATEWAY_PORT (where WS_URL points) and
+# registers its PIDs for teardown.
+GATEWAY="${GATEWAY:-proxy}"
+PIDS=()
+cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done; }
 trap cleanup EXIT
 
-# Wait until the proxy is accepting connections.
-node --input-type=commonjs -e 'const net=require("net");let n=0;const t=setInterval(()=>{const s=net.connect(8091,"127.0.0.1");s.on("connect",()=>{s.end();clearInterval(t);process.exit(0)});s.on("error",()=>{s.destroy();if(++n>150){clearInterval(t);process.exit(1)}})},40)'
+case "$GATEWAY" in
+  proxy)
+    echo "==> building h2ts-proxy"
+    ( cd rust && cargo build --quiet -p h2ts-server --bin h2ts-proxy )
+    # The h2c origin port (override if :8000 is taken locally); the proxy forwards here.
+    ORIGIN_PORT="${ORIGIN_PORT:-8000}"
+    GATEWAY_PORT=8091
+    echo "==> starting origin (:$ORIGIN_PORT) and h2ts-proxy (:$GATEWAY_PORT -> :$ORIGIN_PORT)"
+    ORIGIN_PORT="$ORIGIN_PORT" node conformance/origin.mjs & PIDS+=($!)
+    rust/target/debug/h2ts-proxy "127.0.0.1:$GATEWAY_PORT" "127.0.0.1:$ORIGIN_PORT" & PIDS+=($!)
+    ;;
+  go)
+    # In-process serve gateway: it serves the origin routes itself (no upstream).
+    echo "==> building the Go serve gateway"
+    ( cd go && go build -o "$ROOT/go/bin/h2-server" ./examples/h2-server )
+    GATEWAY_PORT="${GATEWAY_PORT:-8093}"
+    echo "==> starting the Go gateway (serve_h2, in-process h2c on :$GATEWAY_PORT)"
+    "$ROOT/go/bin/h2-server" "127.0.0.1:$GATEWAY_PORT" & PIDS+=($!)
+    ;;
+  *)
+    echo "unknown GATEWAY: $GATEWAY (want: proxy | go)" >&2
+    exit 1
+    ;;
+esac
 
-WS_URL="${WS_URL:-ws://127.0.0.1:8091}"
+# Wait until the gateway is accepting connections.
+node --input-type=commonjs -e 'const net=require("net");const port=+process.argv[1];let n=0;const t=setInterval(()=>{const s=net.connect(port,"127.0.0.1");s.on("connect",()=>{s.end();clearInterval(t);process.exit(0)});s.on("error",()=>{s.destroy();if(++n>150){clearInterval(t);process.exit(1)}})},40)' "$GATEWAY_PORT"
+
+WS_URL="${WS_URL:-ws://127.0.0.1:$GATEWAY_PORT}"
 rc=0
 
 if run_ts; then
