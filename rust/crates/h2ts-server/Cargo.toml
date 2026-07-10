@@ -18,6 +18,7 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
+pin-project-lite = { workspace = true }
 bytes = { workspace = true }
 sha1 = { workspace = true }
 base64 = { workspace = true }

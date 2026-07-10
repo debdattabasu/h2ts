@@ -373,6 +373,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "pin-project-lite",
  "sha1",
  "tokio",
  "wslay-sys",

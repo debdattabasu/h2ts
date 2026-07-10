@@ -166,13 +166,33 @@ clients (`GATEWAY=go`).
 
 Keepalive detects a *dead* client; it does **not** reap a *healthy but idle* one — a
 client that keeps answering keepalive pings but opens no HTTP/2 streams for a long time.
-Added `ServeConfig.IdleTimeout` (wired to `http2.Server.IdleTimeout`): after that long with
-no open streams it sends a graceful `GOAWAY (NO_ERROR)` and closes the WS with 1000, so the
-client reconnects fresh. Crucially the idle clock is reset **only by streams** — WS
-ping/pong and HTTP/2 PING are both excluded (`server.go:131`) — so it behaves exactly as on
-plain TCP and doesn't fight keepalive. Off by default (0), matching `net/http2`. Covered by
-`TestServeH2IdleTimeoutReapsHealthyConnection` (keepalive on + a client that pongs, yet the
-idle TTL still reaps it gracefully → `OnClose` 1000).
+The signal must be **open HTTP/2 streams**, not bytes or pings: a quiet-but-live stream
+(SSE, a slow upload) must never be reaped. That means it can only live where HTTP/2 is
+terminated — the **serve** shape — never in the **proxy** (which pumps raw bytes and has no
+stream visibility; there, idle reaping is the upstream's job).
+
+**Go serve** — `ServeConfig.IdleTimeout`, wired to `http2.Server.IdleTimeout`. After that
+long with no open streams it sends a graceful `GOAWAY (NO_ERROR)` then closes the WS with
+1000. The idle clock is reset **only by streams** — WS ping/pong and HTTP/2 PING are both
+excluded (`server.go:131`) — so it doesn't fight keepalive. Off by default. Covered by
+`TestServeH2IdleTimeoutReapsHealthyConnection`.
+
+**Rust serve** — same behavior, `ServeConfig { bridge, idle_timeout }` +
+`serve_h2_with_config` (non-breaking; `serve_h2`/`serve_h2_with` unchanged). hyper has **no**
+built-in idle timeout, so `src/idle.rs` supplies one: a `TrackedService` takes a
+`StreamGuard` per request that rides the response body and releases on the body's drop
+(stream closed); `wait_idle` watches that count over a `tokio::sync::watch` and, once it's
+been zero for the timeout, the serve loop calls hyper's `graceful_shutdown` (GOAWAY → the
+WsByteStream drops → the bridge sends WS close). Same stream-only semantics. Off by default.
+Covered by `idle_timeout_reaps_a_healthy_but_idle_connection` (keepalive on + a client that
+pongs, yet still reaped). **Rust proxy: not applicable** (wrong layer). Suite: h2ts-server
+**50 tests**.
+
+| | keepalive (dead client) | idle TTL (healthy but no streams) |
+|---|---|---|
+| Go serve | ✅ | ✅ `ServeConfig.IdleTimeout` |
+| Rust serve | ✅ | ✅ `ServeConfig.idle_timeout` |
+| Rust proxy | ✅ | — (wrong layer; the upstream h2c server's job) |
 
 ## Remaining / not pursued
 

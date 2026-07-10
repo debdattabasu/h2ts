@@ -26,6 +26,7 @@
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use hyper::body::{Body, Incoming};
 use hyper::server::conn::http2;
@@ -35,6 +36,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 
 mod handshake;
+mod idle;
 mod wslay;
 
 pub use handshake::{
@@ -155,6 +157,8 @@ where
 /// Like [`serve_h2`], but with control-frame configuration and hooks
 /// ([`BridgeConfig`]) applied to the underlying WebSocket bridge — send control
 /// frames via a [`control_channel`], observe the peer's close reason, etc.
+///
+/// For an HTTP/2 idle timeout too, use [`serve_h2_with_config`].
 pub async fn serve_h2_with<S, Svc, B>(
     ws_io: S,
     service: Svc,
@@ -169,8 +173,81 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    let io = TokioIo::new(WsByteStream::with_config(ws_io, config));
-    http2::Builder::new(TokioExecutor::new())
-        .serve_connection(io, service)
-        .await
+    serve_h2_with_config(
+        ws_io,
+        service,
+        ServeConfig {
+            bridge: config,
+            idle_timeout: None,
+        },
+    )
+    .await
+}
+
+/// Configuration for [`serve_h2_with_config`]: the WebSocket [`BridgeConfig`]
+/// plus an optional HTTP/2 idle timeout.
+#[derive(Default)]
+pub struct ServeConfig {
+    /// WebSocket bridge configuration (keepalive, control frames, close hooks).
+    /// [`ServeConfig::default`] uses [`BridgeConfig::default`] — keepalive on.
+    pub bridge: BridgeConfig,
+    /// If `Some`, gracefully close the connection — an HTTP/2 `GOAWAY`, then the
+    /// WebSocket close — once it has had **no open HTTP/2 streams** for this long,
+    /// reaping a tunnel that is healthy but idle.
+    ///
+    /// This is distinct from keepalive ([`BridgeConfig::keepalive`]), which
+    /// detects a *dead* peer: a client that dutifully answers keepalive pings but
+    /// opens no streams for `idle_timeout` is still reaped. WebSocket and HTTP/2
+    /// pings are **not** activity — only streams reset the timer. `None` (the
+    /// default) never reaps on idle, matching hyper.
+    pub idle_timeout: Option<Duration>,
+}
+
+/// Like [`serve_h2_with`], but also accepts an HTTP/2 [`idle_timeout`] via
+/// [`ServeConfig`]: after that long with no open HTTP/2 streams, the connection
+/// is closed with a graceful `GOAWAY` (then the WebSocket close), so a healthy
+/// but idle client reconnects fresh. hyper has no built-in idle timeout, so this
+/// tracks open streams and drives `graceful_shutdown` itself; a live stream
+/// (even a quiet one) is never reaped, and pings never reset the timer.
+///
+/// [`idle_timeout`]: ServeConfig::idle_timeout
+pub async fn serve_h2_with_config<S, Svc, B>(
+    ws_io: S,
+    service: Svc,
+    config: ServeConfig,
+) -> hyper::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    Svc: Service<Request<Incoming>, Response = Response<B>> + Send + 'static,
+    Svc::Future: Send + 'static,
+    Svc::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    B: Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let ServeConfig {
+        bridge,
+        idle_timeout,
+    } = config;
+    let io = TokioIo::new(WsByteStream::with_config(ws_io, bridge));
+
+    // Wrap the service so we can count open streams and reap on idle.
+    let counter = idle::StreamCounter::new();
+    let service = idle::TrackedService::new(service, counter.clone());
+    let conn = http2::Builder::new(TokioExecutor::new()).serve_connection(io, service);
+
+    let Some(idle) = idle_timeout else {
+        return conn.await;
+    };
+
+    let watch = counter.watch();
+    tokio::pin!(conn);
+    tokio::select! {
+        res = conn.as_mut() => res,
+        // No open streams for `idle`: GOAWAY, admit nothing new, drive to close.
+        () = idle::wait_idle(watch, idle) => {
+            conn.as_mut().graceful_shutdown();
+            conn.as_mut().await
+        }
+    }
 }
