@@ -256,6 +256,38 @@ func TestServeH2KeepAliveStaysUpWhilePeerResponds(t *testing.T) {
 	readBody(t, resp)
 }
 
+// TestServeH2IdleTimeoutReapsHealthyConnection asserts the idle TTL closes a
+// connection that is healthy (still answering keepalive pings) but has had no
+// open streams for IdleTimeout — the case keepalive alone does not handle. The
+// close is graceful: an HTTP/2 GOAWAY followed by a WebSocket 1000.
+func TestServeH2IdleTimeoutReapsHealthyConnection(t *testing.T) {
+	onClose := make(chan CloseFrame, 1)
+	ka := KeepAlive{Interval: 20 * time.Millisecond, Timeout: 20 * time.Millisecond,
+		Close: CloseFrame{Code: closeGoingAway, Reason: "keepalive timeout"}}
+	cfg := ServeConfig{
+		KeepAlive:   &ka, // the client stays "alive" by auto-ponging...
+		IdleTimeout: 100 * time.Millisecond,
+		OnClose:     func(cf CloseFrame) { onClose <- cf },
+	}
+	addr := startGateway(t, testRoutes(), AcceptOptions{}, cfg)
+
+	tunnel, _ := wsDial(t, addr, "/", DefaultSubprotocol)
+	defer tunnel.Close()
+	cc := dialH2(t, tunnel)
+	readBody(t, h2do(t, cc, "GET", "/hello", nil, nil)) // one stream, then idle
+
+	// ...but with no streams open, the idle TTL still reaps it — gracefully (WS
+	// 1000 after the GOAWAY), not as a keepalive timeout (1001) or abnormal (1006).
+	select {
+	case cf := <-onClose:
+		if cf.Code != closeNormal {
+			t.Fatalf("idle reap close code = %d, want %d (graceful)", cf.Code, closeNormal)
+		}
+	case <-timeoutC(t, 3):
+		t.Fatal("idle timeout never reaped a healthy idle connection")
+	}
+}
+
 // TestServeH2ControlFramesDoNotCorruptData spams pings *during* large concurrent
 // transfers; writeMu must keep each control frame between whole data frames, so
 // the h2 payloads stay byte-exact. Mirrors the Rust server's serve_h2_with.rs.

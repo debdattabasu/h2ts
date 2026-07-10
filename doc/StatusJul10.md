@@ -162,6 +162,18 @@ flow-control guarantees above.
 Suite: **35 tests + subtests, green under `-race`**; conformance still passes under both
 clients (`GATEWAY=go`).
 
+## Follow-up: idle TTL (healthy-but-idle reaping)
+
+Keepalive detects a *dead* client; it does **not** reap a *healthy but idle* one — a
+client that keeps answering keepalive pings but opens no HTTP/2 streams for a long time.
+Added `ServeConfig.IdleTimeout` (wired to `http2.Server.IdleTimeout`): after that long with
+no open streams it sends a graceful `GOAWAY (NO_ERROR)` and closes the WS with 1000, so the
+client reconnects fresh. Crucially the idle clock is reset **only by streams** — WS
+ping/pong and HTTP/2 PING are both excluded (`server.go:131`) — so it behaves exactly as on
+plain TCP and doesn't fight keepalive. Off by default (0), matching `net/http2`. Covered by
+`TestServeH2IdleTimeoutReapsHealthyConnection` (keepalive on + a client that pongs, yet the
+idle TTL still reaps it gracefully → `OnClose` 1000).
+
 ## Remaining / not pursued
 
 - **Defaulting `WriteByteTimeout`** — deliberately deferred (see P3); opt-in via

@@ -43,6 +43,15 @@ type ServeConfig struct {
 	// own pings, or rely on transport-level timeouts, instead). [ServeH2] uses
 	// [DefaultKeepAlive].
 	KeepAlive *KeepAlive
+	// IdleTimeout, if > 0, gracefully closes the connection — an HTTP/2 GOAWAY,
+	// then a WebSocket close — once it has had no open HTTP/2 streams for this
+	// long, reaping a tunnel that is healthy but idle. This is distinct from
+	// KeepAlive, which detects a dead client: a client that dutifully answers
+	// keepalive pings but opens no streams for IdleTimeout is still reaped (WS and
+	// HTTP/2 pings don't count as activity — only streams do). 0 (the default)
+	// never reaps on idle, matching net/http2. Ignored when Server is set
+	// (configure http2.Server.IdleTimeout there instead).
+	IdleTimeout time.Duration
 	// OnClose, if set, is called once when the connection ends, with the reason
 	// (see [Conn.CloseReason]).
 	OnClose func(CloseFrame)
@@ -88,7 +97,7 @@ func ServeH2(ws *Conn, handler http.Handler) error {
 func ServeH2With(ws *Conn, handler http.Handler, cfg ServeConfig) error {
 	srv := cfg.Server
 	if srv == nil {
-		srv = &http2.Server{}
+		srv = &http2.Server{IdleTimeout: cfg.IdleTimeout}
 	}
 	// Install the control-frame observation hooks before the read loop starts.
 	ws.onPing = cfg.OnPing
