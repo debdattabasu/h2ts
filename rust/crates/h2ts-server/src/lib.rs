@@ -1,7 +1,7 @@
 //! Make a WebSocket carry a raw byte stream, and serve/proxy HTTP/2 over it.
 //!
 //! [`accept`] performs the server-side WebSocket handshake on a hyper request
-//! (pluggable into any hyper/axum route — item 4) and yields the upgraded
+//! (pluggable into any hyper/axum route) and yields the upgraded
 //! connection as a byte stream. [`bridge`] then pumps bytes full-duplex between
 //! that stream and any `AsyncRead + AsyncWrite` peer (a TCP upstream, an
 //! in-process h2c server, …). WebSocket message *payloads* become a continuous
@@ -14,8 +14,14 @@
 //!
 //! Three entry points sit on top of [`bridge`]:
 //! - [`WsByteStream`] — the WebSocket as an `AsyncRead + AsyncWrite` handle.
-//! - [`serve_h2`] — run any hyper `Service` as HTTP/2 over the tunnel (item 2).
-//! - the `h2ts-proxy` binary — a standalone WS→upstream-h2c proxy (item 3).
+//! - [`serve_h2`] — run any hyper `Service` as HTTP/2 over the tunnel.
+//! - the `h2ts-proxy` binary — a standalone WS→upstream-h2c proxy.
+//!
+//! Part of [h2ts](https://github.com/debdattabasu/h2ts): this server pairs with
+//! the TypeScript [`@debdattabasu/h2ts`](https://www.npmjs.com/package/@debdattabasu/h2ts)
+//! and Rust/WASM [`h2ts-client`](https://crates.io/crates/h2ts-client) frontend
+//! clients — both behavior-mirrored against it by the shared conformance suite —
+//! or any client that forwards a byte stream over a WebSocket.
 
 use std::io;
 use std::pin::Pin;
