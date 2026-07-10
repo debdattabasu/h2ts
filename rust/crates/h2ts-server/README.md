@@ -2,7 +2,7 @@
 
 Make a WebSocket look like a raw TCP byte stream — then **serve or proxy HTTP/2 over it**.
 
-`h2ts-server` is the Rust server side of [**h2ts**](https://github.com/debdattabasu/h2ts), which gives browsers a real HTTP/2 client by tunnelling HTTP/2 frames inside a WebSocket. This crate terminates that WebSocket and hands the raw bytes to any HTTP/2 server — as a standalone proxy, or in-process behind your own routes. It pairs with the [`h2ts`](https://github.com/debdattabasu/h2ts) TypeScript client, or any client that forwards a byte stream over a WebSocket.
+`h2ts-server` is the Rust server side of [**h2ts**](https://github.com/debdattabasu/h2ts), which gives browsers a real HTTP/2 client by tunnelling HTTP/2 frames inside a WebSocket. This crate terminates that WebSocket and hands the raw bytes to any HTTP/2 server — as a standalone proxy, or in-process behind your own routes. It pairs with the [`@debdattabasu/h2ts`](https://www.npmjs.com/package/@debdattabasu/h2ts) TypeScript client and the [`h2ts-client`](https://crates.io/crates/h2ts-client) Rust/WASM client — or any client that forwards a byte stream over a WebSocket.
 
 A WebSocket carries discrete messages; HTTP/2 needs a continuous byte stream. This crate bridges the two — WebSocket message *payloads* become a byte stream, so h2c (cleartext HTTP/2, prior-knowledge) framing rides straight through.
 

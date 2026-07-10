@@ -1,6 +1,6 @@
 [package]
 name = "h2ts-client"
-version = "0.0.0" # scaffold — not yet released; bump to 0.1.0 on first publish
+version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 description = "A from-scratch HTTP/2 client (RFC 7540 + HPACK) for Rust WASM frontends, tunneled over a WebSocket. No hyper, no tokio."

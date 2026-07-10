@@ -6,10 +6,8 @@
 //! `wasm32` bundle: a **sans-I/O protocol engine** plus a pluggable [`Transport`].
 //! HTTP/2 is spoken with prior knowledge (no HTTP/1.1 `Upgrade` round-trip).
 //!
-//! ## Status: scaffold
-//!
-//! The protocol engine is being ported, module-for-module, from the TypeScript
-//! client (`typescript/client/src`). Both clients conform to one wire spec
+//! The protocol engine is a module-for-module port of the TypeScript client
+//! (`typescript/client/src`). Both clients conform to one wire spec
 //! (`spec/protocol.md`) and the shared conformance suite (`conformance/`) — that
 //! shared *behaviour*, not shared code, is what keeps them from diverging.
 //!
@@ -21,10 +19,14 @@
 //! | [`connection`]  | `connection.ts`     | multiplexer, request/response flow     |
 //! | [`transport`]   | `transport/`        | the pluggable byte-duplex              |
 //!
-//! The default `web` feature will provide a browser `WebSocket` [`Transport`] via
+//! The default `web` feature provides a browser `WebSocket` [`Transport`] via
 //! `web-sys`; disable it for host-side engine tests.
 //!
-//! [`h2ts`]: https://www.npmjs.com/package/h2ts
+//! Terminate the WebSocket with the Rust server [`h2ts-server`] (its `h2ts-proxy`
+//! binary, or `websockify`) to reach any HTTP/2 origin.
+//!
+//! [`h2ts`]: https://www.npmjs.com/package/@debdattabasu/h2ts
+//! [`h2ts-server`]: https://crates.io/crates/h2ts-server
 
 mod bytes;
 pub mod connection;

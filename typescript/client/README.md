@@ -53,7 +53,7 @@ This is the TypeScript client — one of three implementations in the [h2ts mono
 
 - **This package (`@debdattabasu/h2ts`)** — the browser/Node client, in TypeScript.
 - **Rust backend — [`h2ts-server`](https://crates.io/crates/h2ts-server)** — makes a WebSocket look like raw TCP and serves or proxies HTTP/2 over it; ships the `h2ts-proxy` binary (a drop-in `websockify`).
-- **Rust frontend — [`h2ts-client`](https://github.com/debdattabasu/h2ts/tree/main/rust/crates/h2ts-client)** — the same client for Rust/WASM frontends (no `hyper`, no `tokio`), behavior-mirrored against this one by the shared conformance battery.
+- **Rust frontend — [`h2ts-client`](https://crates.io/crates/h2ts-client)** — the same client for Rust/WASM frontends (no `hyper`, no `tokio`), behavior-mirrored against this one by the shared conformance battery.
 
 Point `h2ts` at any HTTP/2 server by terminating the WebSocket with `h2ts-server` / `h2ts-proxy` (or `websockify`).
 
