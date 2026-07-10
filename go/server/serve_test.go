@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // testRoutes is a slice of the conformance origin: enough to exercise the h2
@@ -201,6 +202,119 @@ func TestServeH2ControlFrameHooks(t *testing.T) {
 	case <-timeoutC(t, 2):
 		t.Fatal("OnPing never fired after the client ping")
 	}
+}
+
+// TestServeH2LargeUpload drives a 1 MiB POST echo through go test directly (the
+// external-client conformance covers uploads, but the module's own suite didn't).
+// 1 MiB sits right at the default receive window, exercising WINDOW_UPDATE.
+func TestServeH2LargeUpload(t *testing.T) {
+	addr := startGateway(t, testRoutes(), AcceptOptions{}, ServeConfig{})
+	tunnel, _ := wsDial(t, addr, "/", DefaultSubprotocol)
+	defer tunnel.Close()
+	cc := dialH2(t, tunnel)
+
+	payload := make([]byte, 1<<20) // 1 MiB
+	for i := range payload {
+		payload[i] = byte(i * 7)
+	}
+	echoed := readBodyBytes(t, h2do(t, cc, "POST", "/echo", bytes.NewReader(payload), nil))
+	if !bytes.Equal(echoed, payload) {
+		t.Fatalf("1 MiB upload echo mismatch (got %d bytes)", len(echoed))
+	}
+}
+
+// TestServeH2KeepAliveStaysUpWhilePeerResponds asserts keepalive does not kill a
+// healthy connection: the client auto-pongs the server's pings, so across many
+// keepalive intervals the tunnel stays up and still serves. Mirrors the Rust
+// server's keepalive_stays_up_while_peer_responds.
+func TestServeH2KeepAliveStaysUpWhilePeerResponds(t *testing.T) {
+	onClose := make(chan CloseFrame, 1)
+	ka := KeepAlive{Interval: 20 * time.Millisecond, Timeout: 20 * time.Millisecond,
+		Close: CloseFrame{Code: closeGoingAway, Reason: "keepalive timeout"}}
+	cfg := ServeConfig{KeepAlive: &ka, OnClose: func(cf CloseFrame) { onClose <- cf }}
+	addr := startGateway(t, testRoutes(), AcceptOptions{}, cfg)
+
+	tunnel, _ := wsDial(t, addr, "/", DefaultSubprotocol)
+	defer tunnel.Close()
+	cc := dialH2(t, tunnel)
+	readBody(t, h2do(t, cc, "GET", "/hello", nil, nil)) // establish; the h2 read loop auto-pongs
+
+	// Idle across ~10 keepalive intervals; the client keeps ponging.
+	time.Sleep(200 * time.Millisecond)
+	select {
+	case cf := <-onClose:
+		t.Fatalf("keepalive closed a healthy connection: %+v", cf)
+	default:
+	}
+	// The tunnel is still live.
+	resp := h2do(t, cc, "GET", "/hello", nil, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("post-idle request status = %d, want 200", resp.StatusCode)
+	}
+	readBody(t, resp)
+}
+
+// TestServeH2ControlFramesDoNotCorruptData spams pings *during* large concurrent
+// transfers; writeMu must keep each control frame between whole data frames, so
+// the h2 payloads stay byte-exact. Mirrors the Rust server's serve_h2_with.rs.
+func TestServeH2ControlFramesDoNotCorruptData(t *testing.T) {
+	connCh := make(chan *Conn, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := Accept(w, r)
+		if err != nil {
+			return
+		}
+		connCh <- conn
+		go ServeH2With(conn, testRoutes(), ServeConfig{})
+	}))
+	t.Cleanup(ts.Close)
+
+	tunnel, _ := wsDial(t, ts.Listener.Addr().String(), "/", DefaultSubprotocol)
+	defer tunnel.Close()
+	cc := dialH2(t, tunnel)
+	readBody(t, h2do(t, cc, "GET", "/hello", nil, nil))
+	srvConn := <-connCh
+
+	// Interleave a stream of pings with the data traffic.
+	stop := make(chan struct{})
+	var pinger sync.WaitGroup
+	pinger.Add(1)
+	go func() {
+		defer pinger.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				if srvConn.Ping([]byte("probe")) != nil {
+					return
+				}
+				time.Sleep(150 * time.Microsecond)
+			}
+		}
+	}()
+
+	upload := make([]byte, 512*1024)
+	for i := range upload {
+		upload[i] = byte(i * 7)
+	}
+	for iter := 0; iter < 4; iter++ {
+		big := readBodyBytes(t, h2do(t, cc, "GET", "/big", nil, nil))
+		if len(big) != 256*1024 {
+			t.Fatalf("iter %d: /big size = %d", iter, len(big))
+		}
+		for i, b := range big {
+			if b != 'x' {
+				t.Fatalf("iter %d: /big byte %d = %q (ping corrupted DATA)", iter, i, b)
+			}
+		}
+		echoed := readBodyBytes(t, h2do(t, cc, "POST", "/echo", bytes.NewReader(upload), nil))
+		if !bytes.Equal(echoed, upload) {
+			t.Fatalf("iter %d: 512 KiB echo mismatch (ping corrupted DATA)", iter)
+		}
+	}
+	close(stop)
+	pinger.Wait()
 }
 
 func readBody(t *testing.T, resp *http.Response) string {

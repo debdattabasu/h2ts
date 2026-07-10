@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -13,9 +14,19 @@ import (
 // A fixed masking key keeps the framing tests deterministic.
 var testMask = [4]byte{0x37, 0xfa, 0x21, 0x3d}
 
-// clientFrame builds a masked client->server frame (what the server's Conn reads).
+// clientFrame builds a masked, FIN client->server frame (what the server's Conn reads).
 func clientFrame(opcode byte, payload []byte) []byte {
-	frame := []byte{0x80 | opcode}
+	return clientFrameFin(true, opcode, payload)
+}
+
+// clientFrameFin is clientFrame with an explicit FIN bit, for building fragmented
+// messages (a FIN=0 data frame followed by continuation frames).
+func clientFrameFin(fin bool, opcode byte, payload []byte) []byte {
+	b0 := opcode
+	if fin {
+		b0 |= 0x80
+	}
+	frame := []byte{b0}
 	n := len(payload)
 	switch {
 	case n <= 125:
@@ -288,11 +299,11 @@ func TestKeepAliveClosesOnNoPong(t *testing.T) {
 	r := bufio.NewReader(cli)
 
 	// First a keepalive Ping (the client never pongs).
-	if op, _ := readServerCtl(t, r); op != opPing {
+	if op, _ := readWholeServerFrame(t, r); op != opPing {
 		t.Fatalf("first frame opcode = 0x%x, want ping", op)
 	}
 	// Then, with no answer, the keepalive Close.
-	op, payload := readServerCtl(t, r)
+	op, payload := readWholeServerFrame(t, r)
 	if op != opClose {
 		t.Fatalf("second frame opcode = 0x%x, want close", op)
 	}
@@ -307,8 +318,8 @@ func TestKeepAliveClosesOnNoPong(t *testing.T) {
 	}
 }
 
-// readServerCtl reads one full server->client frame (used for control frames).
-func readServerCtl(t *testing.T, r *bufio.Reader) (byte, []byte) {
+// readWholeServerFrame reads one complete server->client (unmasked) frame.
+func readWholeServerFrame(t *testing.T, r *bufio.Reader) (byte, []byte) {
 	t.Helper()
 	var h [2]byte
 	if _, err := io.ReadFull(r, h[:]); err != nil {
@@ -330,6 +341,195 @@ func readServerCtl(t *testing.T, r *bufio.Reader) (byte, []byte) {
 		t.Fatalf("read frame payload: %v", err)
 	}
 	return h[0] & 0x0F, payload
+}
+
+// --- P1/P2 additions -----------------------------------------------------
+
+// tcpPair returns a connected loopback TCP pair (unlike net.Pipe, a real socket
+// has a send buffer, so backpressure surfaces as a blocked write rather than an
+// immediate one).
+func tcpPair(t *testing.T) (client, server net.Conn) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	type accepted struct {
+		c   net.Conn
+		err error
+	}
+	ch := make(chan accepted, 1)
+	go func() {
+		c, err := ln.Accept()
+		ch <- accepted{c, err}
+	}()
+	client, err = net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	a := <-ch
+	if a.err != nil {
+		t.Fatalf("accept: %v", a.err)
+	}
+	return client, a.c
+}
+
+// TestConnBackpressure proves Conn.Write propagates backpressure: with the peer
+// not reading, the writer stalls (does not absorb the whole payload); once the
+// peer drains, it completes byte-exact. Mirrors the Rust server's backpressure.rs.
+func TestConnBackpressure(t *testing.T) {
+	cli, srv := tcpPair(t)
+	defer cli.Close()
+	defer srv.Close()
+	c := newConn(srv, bufio.NewReader(srv), DefaultSubprotocol)
+
+	const chunk = 64 * 1024
+	const chunks = 256 // 16 MiB — comfortably exceeds any autotuned socket buffer
+	const total = chunk * chunks
+	pattern := make([]byte, chunk)
+	for i := range pattern {
+		pattern[i] = byte(i)
+	}
+
+	var written atomic.Int64
+	done := make(chan error, 1)
+	go func() {
+		for i := 0; i < chunks; i++ {
+			if _, err := c.Write(pattern); err != nil {
+				done <- err
+				return
+			}
+			written.Add(chunk)
+		}
+		done <- nil
+	}()
+
+	// With nobody reading, the writer must block long before finishing.
+	time.Sleep(200 * time.Millisecond)
+	if n := written.Load(); n == total {
+		t.Fatal("writer finished with no reader — backpressure not propagated")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("writer completed while the consumer was paused: %v (wrote %d)", err, written.Load())
+	default: // still blocked — correct
+	}
+
+	// Drain the tunnel; the writer completes and every byte is exact.
+	got := make([]byte, 0, total)
+	r := bufio.NewReader(cli)
+	for len(got) < total {
+		op, payload := readWholeServerFrame(t, r)
+		if op != opBinary {
+			t.Fatalf("unexpected opcode 0x%x while draining", op)
+		}
+		got = append(got, payload...)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("writer errored after drain: %v", err)
+	}
+	if written.Load() != total {
+		t.Fatalf("wrote %d, want %d", written.Load(), total)
+	}
+	for i := 0; i < total; i++ {
+		if got[i] != byte(i%chunk) {
+			t.Fatalf("byte %d = %d, want %d", i, got[i], byte(i%chunk))
+		}
+	}
+}
+
+// TestConnReadsFragmentedMessage reassembles a message split across a FIN=0
+// binary frame and a continuation frame, with a ping injected between the
+// fragments (RFC 6455 §5.4 permits interleaved control frames).
+func TestConnReadsFragmentedMessage(t *testing.T) {
+	var inbound []byte
+	inbound = append(inbound, clientFrameFin(false, opBinary, []byte("Hello, "))...)
+	inbound = append(inbound, clientFrame(opPing, []byte("mid"))...)
+	inbound = append(inbound, clientFrameFin(true, opContinuation, []byte("World"))...)
+	c, f := connOver(inbound)
+
+	got, err := io.ReadAll(readerOf(c, len("Hello, World")))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(got) != "Hello, World" {
+		t.Fatalf("reassembled = %q, want %q", got, "Hello, World")
+	}
+	// The ping interleaved between the fragments was still auto-answered.
+	if op, payload, _ := serverFrame(t, f.out.Bytes()); op != opPong || string(payload) != "mid" {
+		t.Fatalf("interleaved ping not auto-ponged: op 0x%x %q", op, payload)
+	}
+}
+
+// TestConnRejectsProtocolViolations covers the readHeader/dispatch rejections
+// that end the stream with a 1002 close: RSV bits, reserved opcodes, and
+// malformed control frames.
+func TestConnRejectsProtocolViolations(t *testing.T) {
+	rsv := clientFrame(opBinary, []byte("x"))
+	rsv[0] |= 0x40 // set RSV1 (no extension negotiated)
+	fragCtl := clientFrame(opPing, []byte("x"))
+	fragCtl[0] &^= 0x80 // clear FIN on a control frame
+
+	cases := []struct {
+		name  string
+		frame []byte
+	}{
+		{"rsv bits set", rsv},
+		{"reserved data opcode", clientFrame(0x3, []byte("x"))},
+		{"reserved control opcode", clientFrame(0xB, []byte("x"))},
+		{"fragmented control frame", fragCtl},
+		{"oversized control frame", clientFrame(opPing, make([]byte, 200))},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, f := connOver(tc.frame)
+			if _, err := c.Read(make([]byte, 16)); err == nil {
+				t.Fatal("expected a protocol error")
+			}
+			if r := c.CloseReason(); r.Code != closeProtocolError {
+				t.Fatalf("CloseReason code = %d, want %d (protocol error)", r.Code, closeProtocolError)
+			}
+			op, payload, _ := serverFrame(t, f.out.Bytes())
+			if op != opClose || binary.BigEndian.Uint16(payload[:2]) != closeProtocolError {
+				t.Fatalf("expected a 1002 close, got op 0x%x", op)
+			}
+		})
+	}
+}
+
+// TestKeepAliveUsesCustomCloseFrame asserts a custom KeepAlive.Close (not the
+// default 1001) is the close the peer receives and the reason surfaced.
+func TestKeepAliveUsesCustomCloseFrame(t *testing.T) {
+	cli, srv := net.Pipe()
+	c := newConn(srv, bufio.NewReader(srv), DefaultSubprotocol)
+	ka := KeepAlive{
+		Interval: 20 * time.Millisecond,
+		Timeout:  20 * time.Millisecond,
+		Close:    CloseFrame{Code: 4020, Reason: "custom-bye"},
+	}
+	done := make(chan struct{})
+	go c.runKeepAlive(ka, done)
+	defer close(done)
+
+	cli.SetReadDeadline(time.Now().Add(2 * time.Second))
+	r := bufio.NewReader(cli)
+	if op, _ := readWholeServerFrame(t, r); op != opPing {
+		t.Fatalf("first frame opcode = 0x%x, want ping", op)
+	}
+	op, payload := readWholeServerFrame(t, r)
+	if op != opClose {
+		t.Fatalf("second frame opcode = 0x%x, want close", op)
+	}
+	if code := binary.BigEndian.Uint16(payload[:2]); code != 4020 {
+		t.Fatalf("close code = %d, want 4020", code)
+	}
+	if reason := string(payload[2:]); reason != "custom-bye" {
+		t.Fatalf("close reason = %q, want custom-bye", reason)
+	}
+	if got := c.CloseReason(); got.Code != 4020 || got.Reason != "custom-bye" {
+		t.Fatalf("CloseReason = %+v, want {4020 custom-bye}", got)
+	}
 }
 
 // readerOf adapts Conn.Read to an io.Reader that stops after total bytes.
