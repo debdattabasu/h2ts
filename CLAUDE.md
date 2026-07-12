@@ -149,4 +149,4 @@ and direction by the author, with Claude implementing, testing, and documenting 
 the TypeScript, Rust, and Go stacks. Keeping this `CLAUDE.md` is the author's chosen way
 to acknowledge that, plainly and up front, rather than burying it. AI-assisted authorship
 is still met with suspicion in parts of the open-source world; this is a small, honest
-statement that it happened and that the work stands on its tests.
+statement that it happened and that it works well and that the work stands on its tests and its rigorous human in the loop audit process.
