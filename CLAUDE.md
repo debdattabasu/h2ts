@@ -30,6 +30,35 @@ Consequences for any change:
 - When you add a capability to one server, check whether its sibling should match,
   and record the decision (see `doc/`). Parity is deliberate, not assumed.
 
+## Auditing for drift
+
+Conformance proves wire-level interop, but it can't catch *subtle* divergence — a
+receive-path branch one implementation handles and another silently doesn't, an edge the
+spec implies but no test exercises, a behavior that has quietly drifted from the spec's
+intent. Two practices catch that:
+
+- **Fresh-context audits.** Periodically a fresh agent — no prior conversation, no
+  assumptions carried in — is given the broad **system invariants** (the spec's
+  guarantees, the share-no-code/stay-interoperable rule, the intended behavior of each
+  layer) and asked to evaluate the **current** state of the spec, the tests, and the code
+  against them. It reads the full source and tests across all stacks and reports two
+  things: **logic drift** — where implementations diverge from each other or from the spec
+  — and **test-coverage gaps** — paths that are plausible but unproven. Each audit is a
+  dated document under `doc/` with a work log that turns every finding into a fix or a
+  recorded decision. `doc/status.md` (TS/Rust client + Rust server) and
+  `doc/StatusJul10.md` (Go server flow-control + coverage) are the current examples; a
+  real correctness bug — the Rust client's early-complete-response upload truncation — was
+  found exactly this way, in the least-tested neighborhood the audit flagged.
+- **Author coverage review.** The author also audits test coverage by hand on a regular
+  basis, specifically hunting the edge cases that conformance and automated tooling tend
+  to miss — receive-path robustness, lifecycle/teardown, and flow-control corners that
+  only surface under an adversarial reading.
+
+Assume any change will be read this way. Leave the spec, the tests, and the code mutually
+consistent, and prefer pinning an edge with a test over trusting that it's "obviously
+correct" — the audits exist precisely because obvious-looking code is where the drift
+hides.
+
 ## Layout
 
 ```
