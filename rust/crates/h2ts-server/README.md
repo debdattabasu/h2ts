@@ -62,6 +62,21 @@ wslay auto-answers pings with pongs and echoes closes. A `BridgeConfig` (passed 
 - Set the **close code + reason** sent on teardown.
 - Turn on server-initiated **keepalive** (`KeepAlive`): ping when idle, close if no pong arrives in time.
 
+## Idle connections (serve)
+
+`serve_h2_with_config` adds an optional HTTP/2 **idle timeout** to the serve path: after that long with **no open HTTP/2 streams**, the connection is closed with a graceful `GOAWAY` (then the WebSocket close), so a healthy but idle client reconnects fresh. It's distinct from keepalive — which detects a *dead* peer — so a client that keeps answering keepalive pings but opens no streams is still reaped; pings never reset the timer, only streams do. Off by default. (The standalone proxy can't do this: it forwards raw bytes and has no HTTP/2-stream visibility, so idle reaping there is the upstream server's job.)
+
+```rust
+use h2ts_server::{serve_h2_with_config, ServeConfig};
+use std::time::Duration;
+
+// keepalive stays on (BridgeConfig default); reap after 5 min with no streams.
+let _ = serve_h2_with_config(ws, my_service, ServeConfig {
+    idle_timeout: Some(Duration::from_secs(300)),
+    ..Default::default()
+}).await;
+```
+
 ## Subprotocol negotiation
 
 The client offers the `h2ts` subprotocol. `accept` echoes it and **rejects** a client that doesn't offer it (`400` via `err.rejection_response()`). `accept_with` hands your handler the full offered list to choose from; `accept_with_options` with `allow_implicit_codec` accepts whatever codec the client offered first.

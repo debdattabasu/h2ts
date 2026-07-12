@@ -1,6 +1,6 @@
 [package]
 name = "h2ts-server"
-version = "0.1.1"
+version = "0.1.2"
 edition.workspace = true
 license.workspace = true
 description = "Make a WebSocket look like raw TCP, and serve/proxy HTTP/2 over it. Framed by wslay for true sub-frame streaming. Includes the h2ts-proxy binary."
