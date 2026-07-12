@@ -30,7 +30,7 @@ Consequences for any change:
 - When you add a capability to one server, check whether its sibling should match,
   and record the decision (see `doc/`). Parity is deliberate, not assumed.
 
-## Auditing for drift
+## Audit process
 
 Conformance proves wire-level interop, but it can't catch *subtle* divergence — a
 receive-path branch one implementation handles and another silently doesn't, an edge the
@@ -149,4 +149,4 @@ and direction by the author, with Claude implementing, testing, and documenting 
 the TypeScript, Rust, and Go stacks. Keeping this `CLAUDE.md` is the author's chosen way
 to acknowledge that, plainly and up front, rather than burying it. AI-assisted authorship
 is still met with suspicion in parts of the open-source world; this is a small, honest
-statement that it happened and that it works well and that the work stands on its tests and its rigorous human in the loop audit process.
+statement that it happened and that it works well and that the work stands on its tests and its rigorous human in the loop audit process, as described in previous sections.
