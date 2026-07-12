@@ -86,7 +86,8 @@ The conformance suite runs a fixed battery — routing, JSON, byte-exact uploads
 - [x] Monorepo restructure: one wire spec + conformance suite across languages
 - [x] **`h2ts-client` (Rust)** — a `wasm32`, no-hyper client for Rust frontends, [published to crates.io](https://crates.io/crates/h2ts-client)
 - [x] Publish the [`@debdattabasu/h2ts`](https://www.npmjs.com/package/@debdattabasu/h2ts) client to npm
-- [x] **Go server** — `Accept` + `ServeH2` serve any `net/http` handler as h2c over the tunnel (in-process serve shape; the proxy stays the single Rust `h2ts-proxy`). Pure-Go RFC 6455 framing; passes conformance under both clients ([`go/`](go))
+- [x] **Go server** ([`go/`](go)) — `Accept` + `ServeH2` serve any `net/http` handler as h2c over the tunnel (in-process serve shape; the proxy stays the single Rust `h2ts-proxy`). Pure-Go RFC 6455 framing, control-frame hooks, server-initiated keepalive, and an HTTP/2 idle timeout; passes conformance under both the TypeScript and Rust clients
+- [x] **HTTP/2 idle timeout** on the serve gateways — reap a healthy-but-idle connection (no open streams for a TTL) with a graceful `GOAWAY`, in **both** the Go server and the Rust `serve_h2` ([`h2ts-server` 0.1.2](https://crates.io/crates/h2ts-server))
 - [ ] **Node.js server** (`@h2ts/server`) — serve a `node:http2` service over the tunnel *(scaffolded)*
 - [ ] **Envoy filter** — terminate the WebSocket tunnel as an Envoy HTTP filter, to run the gateway inside an existing Envoy/proxy mesh
 
