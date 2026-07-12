@@ -144,9 +144,6 @@ gateway/client combination must pass it identically.
 
 ## A note on how this was built
 
-h2ts is developed in collaboration with **Claude (Anthropic's Claude Code)** — design
-and direction by the author, with Claude implementing, testing, and documenting across
-the TypeScript, Rust, and Go stacks. Keeping this `CLAUDE.md` is the author's chosen way
-to acknowledge that, plainly and up front, rather than burying it. AI-assisted authorship
-is still met with suspicion in parts of the open-source world; this is a small, honest
-statement that it happened and that it works well and that the work stands on its tests and its rigorous human in the loop audit process, as described in previous sections.
+h2ts is developed in collaboration with **Claude (Anthropic's Claude Code)** — architectural design, constraints, and direction are driven entirely by the author, with Claude accelerating implementation, testing, and documentation across the TypeScript, Rust, and Go stacks. Maintaining this CLAUDE.md is a choice to be upfront about this leverage rather than burying it.
+
+While AI-assisted authorship is often met with justified suspicion regarding code quality, h2ts doesn't rely on blind generation. The work stands firmly on its cross-stack conformance suites and the rigorous, human-in-the-loop adversarial audit process detailed above. AI is the leverage; human verification is the guarantee.
