@@ -2,6 +2,7 @@
 
 > **HTTP/2 in the frontend — tunneled over WebSockets.** Native HTTP/2 clients and servers that carry HTTP/2 frames inside a WebSocket, one language at a time.
 
+[![CI](https://github.com/debdattabasu/h2ts/actions/workflows/ci.yml/badge.svg)](https://github.com/debdattabasu/h2ts/actions/workflows/ci.yml)
 ![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 ![client](https://img.shields.io/badge/ts%20client-~9%20KB%20gzip-brightgreen)
 ![tests](https://img.shields.io/badge/tests-vitest%20%2B%20cargo-informational)

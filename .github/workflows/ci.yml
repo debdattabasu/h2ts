@@ -1,0 +1,158 @@
+# CI for the h2ts monorepo — the Makefile's targets, run on every push and PR.
+#
+# The stacks share no code (see CLAUDE.md), so each gets its own job and they run
+# in parallel: rust = `make test-rust`, typescript = `make test-ts`, go = `make
+# test-go`. Those prove each stack against itself, which is necessary but not
+# sufficient — what proves *interop* is `conformance`, the executable form of
+# spec/protocol.md. Every gateway runs the same battery through every client, so
+# it is a matrix (`make conformance` / `make conformance-go`, with CLIENT=all).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same ref supersedes an in-flight run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: rust (test + clippy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      # wslay-sys generates its FFI bindings with bindgen at build time, and
+      # bindgen dlopens libclang. (The C compiler for the vendored wslay sources
+      # is already on the image.)
+      - name: Install libclang (bindgen)
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+
+      - name: cargo test
+        run: cargo test --locked
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      # `cargo fmt --check` is deliberately NOT gated here: the tree carries a
+      # known rustfmt-version diff (see CLAUDE.md), and pinning CI to one rustfmt
+      # would only move that disagreement rather than settle it.
+
+  typescript:
+    name: typescript (vitest + typecheck + build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: typescript
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: typescript/package-lock.json
+
+      - run: npm ci
+      # The workspace is the scoped name — `-w @debdattabasu/h2ts`, not `-w h2ts`.
+      - name: vitest
+        run: npm test -w @debdattabasu/h2ts
+      - name: typecheck
+        run: npm run typecheck -w @debdattabasu/h2ts
+      # The bundle is what ships to npm; a build that breaks is a release that breaks.
+      - name: build
+        run: npm run build -w @debdattabasu/h2ts
+
+  go:
+    name: go (vet + test -race)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      # The Conn has concurrent writers (control frames racing data writes for the
+      # single write lock), so the race detector is not optional here.
+      - name: go test -race
+        run: go test -race ./...
+
+  conformance:
+    name: conformance (${{ matrix.gateway }} gateway)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      # Both gateways are behavior-mirrored by this battery: when one fails, the
+      # other's result is the interesting half of the comparison. Never cancel it.
+      fail-fast: false
+      matrix:
+        gateway: [proxy, go]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: conformance-${{ matrix.gateway }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: typescript/package-lock.json
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+      - name: Install libclang (bindgen, for the proxy's wslay-sys)
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+
+      # The wasm-bindgen CLI must match the wasm-bindgen crate the client links
+      # against, so read the version out of the lockfile instead of pinning it in
+      # a second place where it can silently drift.
+      - name: Resolve wasm-bindgen version from Cargo.lock
+        id: wasm_bindgen
+        run: |
+          version=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/"/, "", $3); print $3; exit }' rust/Cargo.lock)
+          [ -n "$version" ] || { echo "wasm-bindgen not found in rust/Cargo.lock" >&2; exit 1; }
+          echo "wasm-bindgen crate: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ steps.wasm_bindgen.outputs.version }}
+
+      # run.sh installs deps itself, but a lockfile-exact install first keeps the
+      # client under test identical to the one the typescript job built.
+      - run: npm ci
+        working-directory: typescript
+
+      # CLIENT=all — the TS client, the Rust client (native transport), and the
+      # Rust client compiled to wasm32 driving its real browser WebSocket path.
+      - name: conformance battery
+        run: CLIENT=all GATEWAY=${{ matrix.gateway }} bash conformance/run.sh

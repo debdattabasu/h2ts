@@ -94,7 +94,7 @@ async fn open_ws(
 /// payloads become byte chunks; outbound byte chunks become WS binary frames.
 /// Control frames stay at the WebSocket layer (fastwebsockets auto-answers pings).
 fn ws_transport(ws: WebSocket<TokioIo<Upgraded>>) -> Transport {
-    let (mut ws_read, ws_write) = ws.split(|s| tokio::io::split(s));
+    let (mut ws_read, ws_write) = ws.split(tokio::io::split);
     let ws_write = Arc::new(Mutex::new(ws_write));
 
     // Inbound: WS frames -> byte chunks. Dropping `in_tx` (on Close/EOF/error)
@@ -253,11 +253,9 @@ async fn run() -> i32 {
     let many = join_all((0..8).map(|_| conn.request(get("/json")))).await;
     let ok_count = {
         let mut n = 0usize;
-        for r in many {
-            if let Ok(mut r) = r {
-                if r.text().await.unwrap_or_default().contains("\"ok\":true") {
-                    n += 1;
-                }
+        for mut r in many.into_iter().flatten() {
+            if r.text().await.unwrap_or_default().contains("\"ok\":true") {
+                n += 1;
             }
         }
         n

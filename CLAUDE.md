@@ -73,6 +73,7 @@ rust/  crates/
 go/                       module github.com/debdattabasu/h2ts/go, package server (serve shape only)
 doc/                      status.md (client/server audit), StatusJul10.md (Go server + idle-TTL audit)
 Makefile                  fans out across stacks
+.github/workflows/ci.yml  the same targets on every push/PR (see CI below)
 ```
 
 ## Build & test
@@ -95,6 +96,16 @@ Per stack, directly:
   writers — always run `-race` on server changes), `gofmt -w server/`, `go vet ./...`.
 - **TypeScript:** `cd typescript && npm test -w @debdattabasu/h2ts` (workspace is the
   scoped name, **not** `-w h2ts`), `npm run typecheck -w @debdattabasu/h2ts`.
+
+**CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs these on every push
+to `main` and every PR: one job per stack (Rust `cargo test` + `clippy -D warnings`, TS
+vitest/typecheck/build, Go `vet` + `test -race` + `gofmt`), plus a **conformance matrix**
+over both gateways with `CLIENT=all` — so the wasm client's real browser WebSocket path
+is covered too. Two deliberate omissions: `cargo fmt --check` is not gated (the known
+rustfmt-version diff would just fail everywhere), and there is **no publishing from CI** —
+releases stay the manual flow under Conventions, so a crates.io push is never one merge
+away. The wasm-bindgen CLI version is read out of `rust/Cargo.lock` rather than pinned in
+the workflow, so it cannot drift from the crate the client links.
 
 Conformance selectors (env vars to `conformance/run.sh`):
 `GATEWAY=proxy|go` (default `proxy`), `CLIENT=ts|rust|wasm|both|all` (default `both`),
