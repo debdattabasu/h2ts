@@ -3,7 +3,7 @@
   "version": "0.1.1",
   "description": "A tiny HTTP/2 client for the browser, tunneled over a WebSocket (or any byte duplex). Idiomatic TypeScript, no Node core deps.",
   "type": "module",
-  "license": "MIT",
+  "license": "MIT OR Apache-2.0",
   "author": "Debdatta Basu",
   "homepage": "https://github.com/debdattabasu/h2ts/tree/main/typescript/client#readme",
   "repository": {
@@ -44,7 +44,8 @@
     "dist/index.js",
     "dist/index.d.ts",
     "README.md",
-    "LICENSE"
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
   ],
   "scripts": {
     "build": "tsup",

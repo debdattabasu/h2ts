@@ -90,4 +90,5 @@ This crate depends on `wslay-sys`, which compiles vendored C and generates bindi
 
 ## License
 
-MIT. Part of [h2ts](https://github.com/debdattabasu/h2ts).
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+Part of [h2ts](https://github.com/debdattabasu/h2ts).

@@ -17,6 +17,8 @@ wslay's event API, with `wslay_event_config_set_no_buffering`, delivers frame pa
 
 ## License
 
-This crate is MIT-licensed. The vendored wslay sources are also MIT-licensed — see [`vendor/COPYING`](vendor/COPYING).
+The bindings in this crate are dual-licensed under [MIT](LICENSE-MIT) or
+[Apache-2.0](LICENSE-APACHE), at your option. The vendored wslay C sources are
+third-party and remain MIT-only — see [`vendor/COPYING`](vendor/COPYING).
 
 Part of [h2ts](https://github.com/debdattabasu/h2ts).

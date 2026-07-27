@@ -4,5 +4,5 @@
   "private": true,
   "description": "Node.js server for h2ts — terminate the WebSocket tunnel and serve/proxy HTTP/2. (not yet implemented)",
   "type": "module",
-  "license": "MIT"
+  "license": "MIT OR Apache-2.0"
 }

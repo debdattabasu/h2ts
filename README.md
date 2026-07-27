@@ -2,7 +2,7 @@
 
 > **HTTP/2 in the frontend — tunneled over WebSockets.** Native HTTP/2 clients and servers that carry HTTP/2 frames inside a WebSocket, one language at a time.
 
-![license](https://img.shields.io/badge/license-MIT-blue)
+![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 ![client](https://img.shields.io/badge/ts%20client-~9%20KB%20gzip-brightgreen)
 ![tests](https://img.shields.io/badge/tests-vitest%20%2B%20cargo-informational)
 
@@ -93,4 +93,19 @@ The conformance suite runs a fixed battery — routing, JSON, byte-exact uploads
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option. This is the customary dual license of the Rust ecosystem: the MIT
+option keeps things permissive and familiar, the Apache-2.0 option adds an explicit
+patent grant. The vendored wslay C sources under
+[`rust/crates/wslay-sys/vendor`](rust/crates/wslay-sys/vendor) are third-party and
+remain MIT-only — see [`vendor/COPYING`](rust/crates/wslay-sys/vendor/COPYING).
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for
+inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual
+licensed as above, without any additional terms or conditions.

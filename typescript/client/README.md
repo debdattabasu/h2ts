@@ -59,4 +59,5 @@ Point `h2ts` at any HTTP/2 server by terminating the WebSocket with `h2ts-server
 
 ## License
 
-MIT
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+Part of [h2ts](https://github.com/debdattabasu/h2ts).

@@ -12,4 +12,5 @@ Planned surface (mirrors `h2ts-server`), all conforming to [`spec/protocol.md`](
 
 ## License
 
-MIT. Part of [h2ts](https://github.com/debdattabasu/h2ts).
+Dual-licensed under [MIT](../../LICENSE-MIT) or [Apache-2.0](../../LICENSE-APACHE), at
+your option. Part of [h2ts](https://github.com/debdattabasu/h2ts).
