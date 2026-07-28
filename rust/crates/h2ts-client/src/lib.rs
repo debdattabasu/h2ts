@@ -43,6 +43,7 @@ pub const DEFAULT_SUBPROTOCOL: &str = "h2ts";
 
 pub use connection::{
     connect, ConnectOptions, H2Connection, RequestBody, RequestInit, Response, ResponseBody,
+    Trailers,
 };
 pub use errors::{ErrorCode, H2Error};
 pub use hpack::Header;

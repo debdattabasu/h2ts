@@ -224,6 +224,32 @@ impl Response {
     pub fn trailers(&self) -> Option<HashMap<String, String>> {
         self.trailers.borrow().clone()
     }
+
+    /// Split into the body stream and a trailer handle that outlives it.
+    ///
+    /// [`into_body`](Self::into_body) takes `self` while [`trailers`](Self::trailers)
+    /// needs `&self`, so a caller could otherwise **stream the body or read the
+    /// trailers, never both**. gRPC needs both: its terminal status arrives in the
+    /// trailers, after the last message — so on the streaming cardinalities a caller
+    /// without this cannot tell a failed stream from a successfully empty one.
+    ///
+    /// The TypeScript client has no such split (`body` and `trailers()` are both
+    /// members of one object), so this is what keeps the two at parity.
+    pub fn into_parts(self) -> (ResponseBody, Trailers) {
+        (self.body, Trailers(self.trailers))
+    }
+}
+
+/// A handle to a response's trailers that stays readable after the body has been
+/// taken. See [`Response::into_parts`].
+#[derive(Clone)]
+pub struct Trailers(Rc<RefCell<Option<HashMap<String, String>>>>);
+
+impl Trailers {
+    /// The trailers, or `None` until the body has ended (or if there were none).
+    pub fn get(&self) -> Option<HashMap<String, String>> {
+        self.0.borrow().clone()
+    }
 }
 
 /// Settings we advertise + push handling (port of `ConnectOptions`).

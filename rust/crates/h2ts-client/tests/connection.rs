@@ -1141,6 +1141,92 @@ fn surfaces_response_trailers() {
 }
 
 #[test]
+fn into_parts_keeps_trailers_readable_after_streaming_the_body() {
+    // The gRPC shape: read messages incrementally *and* learn how the call ended.
+    // `into_body()` takes `self` and `trailers()` needs `&self`, so without
+    // `into_parts` a caller could have one or the other — and a gRPC client that
+    // streams would never see its terminal status, making a failed stream
+    // indistinguishable from a successfully empty one. The TypeScript client has
+    // both on one object; this is the Rust sibling's parity.
+    let mut pool = LocalPool::new();
+    let sp = pool.spawner();
+    let (transport, c2s_rx, s2c_tx) = mock_transport();
+    let (conn, driver) = connect(transport, ConnectOptions::default());
+    sp.spawn_local(driver).unwrap();
+
+    pool.run_until(async move {
+        let client = async move {
+            let res = conn
+                .request(RequestInit {
+                    path: Some("/rpc".into()),
+                    authority: Some("example.com".into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let (mut body, trailers) = res.into_parts();
+
+            let mut chunks = Vec::new();
+            while let Some(chunk) = body.next().await {
+                chunks.push(chunk.unwrap());
+            }
+            assert_eq!(chunks, vec![b"one".to_vec(), b"two".to_vec()]);
+
+            // ...and the handle still reads them once the body has ended.
+            let trailers = trailers.get().expect("trailers should be present");
+            assert_eq!(trailers.get("grpc-status").map(String::as_str), Some("14"));
+        };
+
+        let server = async move {
+            let mut server = ServerSide::new(c2s_rx);
+            server.read_preface().await;
+            assert!(matches!(server.next_frame().await, Frame::Settings { .. }));
+            assert!(matches!(
+                server.next_frame().await,
+                Frame::Headers { stream_id: 1, .. }
+            ));
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Settings {
+                    ack: false,
+                    settings: Settings::default(),
+                }))
+                .unwrap();
+            let head = HpackEncoder::new().encode(&[Header::new(":status", "200")]);
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Headers {
+                    stream_id: 1,
+                    header_block_fragment: head,
+                    end_stream: false,
+                    end_headers: true,
+                    priority: None,
+                }))
+                .unwrap();
+            for chunk in [b"one".to_vec(), b"two".to_vec()] {
+                s2c_tx
+                    .unbounded_send(serialize_frame(&Frame::Data {
+                        stream_id: 1,
+                        data: chunk,
+                        end_stream: false,
+                    }))
+                    .unwrap();
+            }
+            let trailers = HpackEncoder::new().encode(&[Header::new("grpc-status", "14")]);
+            s2c_tx
+                .unbounded_send(serialize_frame(&Frame::Headers {
+                    stream_id: 1,
+                    header_block_fragment: trailers,
+                    end_stream: true,
+                    end_headers: true,
+                    priority: None,
+                }))
+                .unwrap();
+        };
+
+        futures::join!(client, server);
+    });
+}
+
+#[test]
 fn honors_a_retroactively_shrunk_send_window() {
     // The peer lowering SETTINGS_INITIAL_WINDOW_SIZE mid-stream retroactively
     // shrinks a live stream's send window — possibly negative (RFC 7540 §6.9.2).
