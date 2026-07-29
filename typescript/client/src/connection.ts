@@ -411,8 +411,14 @@ export class H2Connection {
       return;
     }
 
-    const stream = new H2Stream(promisedId, this.remote.initialWindowSize, "reservedRemote", (n) =>
-      this.replenishRecvWindow(promisedId, n),
+    const stream = new H2Stream(
+      promisedId,
+      this.remote.initialWindowSize,
+      "reservedRemote",
+      (n) => this.replenishRecvWindow(promisedId, n),
+      () => {
+        if (this.streams.has(promisedId)) this.resetStream(promisedId, "CANCEL");
+      },
     );
     // A pushed stream is half-closed(local) from the start — the client never
     // sends a body on it — so its send side counts as done for retirement.
@@ -450,8 +456,15 @@ export class H2Connection {
 
     const id = this.nextStreamId;
     this.nextStreamId += 2;
-    const stream = new H2Stream(id, this.remote.initialWindowSize, "open", (n) =>
-      this.replenishRecvWindow(id, n),
+    const stream = new H2Stream(
+      id,
+      this.remote.initialWindowSize,
+      "open",
+      (n) => this.replenishRecvWindow(id, n),
+      // Abandoning the body cancels the request, the same as aborting its signal.
+      () => {
+        if (this.streams.has(id)) this.resetStream(id, "CANCEL");
+      },
     );
     this.streams.set(id, stream); // reserves the slot synchronously
 

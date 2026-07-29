@@ -84,17 +84,21 @@ export class H2Stream {
   private bodyDone = false;
   /** Return `n` consumed/abandoned bytes to the receive-flow windows. */
   private readonly onConsume: (n: number) => void;
+  /** Reset the stream: the consumer abandoned the body mid-flight. */
+  private readonly onCancel: () => void;
 
   constructor(
     id: number,
     initialSendWindow: number,
     state: StreamState = "idle",
     onConsume: (n: number) => void = () => {},
+    onCancel: () => void = () => {},
   ) {
     this.id = id;
     this.state = state;
     this.sendWindow = new SendWindow(initialSendWindow);
     this.onConsume = onConsume;
+    this.onCancel = onCancel;
     this.body = new ReadableStream<Uint8Array>(
       {
         pull: (controller) => this.pullBody(controller),
@@ -198,13 +202,22 @@ export class H2Stream {
   }
 
   /** The consumer cancelled the body: return the window for the bytes still
-   * buffered (so the connection window doesn't leak), then discard them. */
+   * buffered (so the connection window doesn't leak), discard them, and tell the
+   * peer to stop.
+   *
+   * The reset is the load-bearing half. Without it the server keeps producing into
+   * a body nobody will ever read — the request stays open and its handler keeps
+   * running — so a consumer that walks away silently leaks work on the far end. */
   private cancelBody(): void {
+    // Only a stream that is still live needs telling. One that already ended or
+    // failed is closed, and resetting it would be a spurious frame on a dead stream.
+    const live = !this.bodyDone && !this.recvEnded && this.recvError === undefined;
     this.bodyDone = true;
     if (this.recvBuffered > 0) {
       this.onConsume(this.recvBuffered);
       this.recvBuffered = 0;
     }
     this.recvQueue.length = 0;
+    if (live) this.onCancel();
   }
 }

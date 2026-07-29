@@ -2276,3 +2276,155 @@ fn an_unterminated_header_block_interrupted_by_data_is_a_protocol_error() {
         assert!(conn_probe.is_closed(), "connection should be closed");
     });
 }
+
+#[test]
+fn abandoning_a_body_cancels_the_stream() {
+    // Dropping a `ResponseBody` mid-stream is how a caller says "no longer
+    // interested" — a deadline firing, a `select!` losing, a UI view going away.
+    // The peer has to be told, or it keeps producing into a stream nobody will read
+    // and the request stays open on the server for as long as the connection does.
+    let mut pool = LocalPool::new();
+    let sp = pool.spawner();
+    let (transport, c2s_rx, s2c_tx) = mock_transport();
+    let (conn, driver) = connect(transport, ConnectOptions::default());
+    sp.spawn_local(driver).unwrap();
+
+    sp.spawn_local(async move {
+        let res = conn
+            .request(RequestInit {
+                path: Some("/stream".into()),
+                authority: Some("e".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // Take the body and drop it without reading to the end.
+        drop(res.into_body());
+    })
+    .unwrap();
+
+    pool.run_until(async move {
+        let mut server = ServerSide::new(c2s_rx);
+        server.read_preface().await;
+        assert!(matches!(server.next_frame().await, Frame::Settings { .. }));
+        assert!(matches!(
+            server.next_frame().await,
+            Frame::Headers { stream_id: 1, .. }
+        ));
+        s2c_tx
+            .unbounded_send(serialize_frame(&Frame::Settings {
+                ack: false,
+                settings: Settings::default(),
+            }))
+            .unwrap();
+        let head = HpackEncoder::new().encode(&[Header::new(":status", "200")]);
+        s2c_tx
+            .unbounded_send(serialize_frame(&Frame::Headers {
+                stream_id: 1,
+                header_block_fragment: head,
+                end_stream: false,
+                end_headers: true,
+                priority: None,
+            }))
+            .unwrap();
+        // An open-ended body: the server is still sending when the client walks away.
+        s2c_tx
+            .unbounded_send(serialize_frame(&Frame::Data {
+                stream_id: 1,
+                data: b"partial".to_vec(),
+                end_stream: false,
+            }))
+            .unwrap();
+
+        // Drain rather than block on `next_frame`: if the reset is missing, this
+        // must fail with a message, not hang until CI kills it.
+        quiesce().await;
+        let mut cancelled = false;
+        while let Some(frame) = server.try_next_frame() {
+            if let Frame::RstStream {
+                stream_id: 1,
+                error_code,
+            } = frame
+            {
+                // CANCEL, not an error code: nothing went wrong, the reader left.
+                assert_eq!(error_code, 0x8, "expected CANCEL");
+                cancelled = true;
+            }
+        }
+        assert!(cancelled, "dropping the body never reset the stream");
+    });
+}
+
+#[test]
+fn a_body_read_to_the_end_is_not_reset_on_drop() {
+    // The other half: a stream that finished normally is already closed, so dropping
+    // its body must send nothing. Resetting here would be a spurious frame on a
+    // closed stream, and the "cancel on drop" rule is worthless if it cannot tell a
+    // completed download from an abandoned one.
+    let mut pool = LocalPool::new();
+    let sp = pool.spawner();
+    let (transport, c2s_rx, s2c_tx) = mock_transport();
+    let (conn, driver) = connect(transport, ConnectOptions::default());
+    sp.spawn_local(driver).unwrap();
+
+    let (done_tx, done_rx) = oneshot::channel::<()>();
+    sp.spawn_local(async move {
+        let res = conn
+            .request(RequestInit {
+                path: Some("/download".into()),
+                authority: Some("e".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut body = res.into_body();
+        while let Some(chunk) = body.next().await {
+            chunk.unwrap();
+        }
+        drop(body);
+        let _ = done_tx.send(());
+    })
+    .unwrap();
+
+    pool.run_until(async move {
+        let mut server = ServerSide::new(c2s_rx);
+        server.read_preface().await;
+        assert!(matches!(server.next_frame().await, Frame::Settings { .. }));
+        assert!(matches!(
+            server.next_frame().await,
+            Frame::Headers { stream_id: 1, .. }
+        ));
+        s2c_tx
+            .unbounded_send(serialize_frame(&Frame::Settings {
+                ack: false,
+                settings: Settings::default(),
+            }))
+            .unwrap();
+        let head = HpackEncoder::new().encode(&[Header::new(":status", "200")]);
+        s2c_tx
+            .unbounded_send(serialize_frame(&Frame::Headers {
+                stream_id: 1,
+                header_block_fragment: head,
+                end_stream: false,
+                end_headers: true,
+                priority: None,
+            }))
+            .unwrap();
+        s2c_tx
+            .unbounded_send(serialize_frame(&Frame::Data {
+                stream_id: 1,
+                data: b"all of it".to_vec(),
+                end_stream: true,
+            }))
+            .unwrap();
+
+        done_rx.await.unwrap();
+        quiesce().await;
+        while let Some(frame) = server.try_next_frame() {
+            assert!(
+                !matches!(frame, Frame::RstStream { .. }),
+                "reset a stream that had already ended cleanly"
+            );
+        }
+    });
+}

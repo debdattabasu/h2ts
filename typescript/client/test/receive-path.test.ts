@@ -773,3 +773,85 @@ describe("receive path: flow control + GOAWAY + framing", () => {
     expect(conn.isClosed).toBe(true);
   }, 8000);
 });
+
+describe("cancellation: abandoning a response body", () => {
+  it("resets the stream when the consumer abandons the body", async () => {
+    // Cancelling a body is how a consumer says "no longer interested" — a deadline
+    // firing, a view unmounting. The peer has to be told, or it keeps producing
+    // into a stream nobody will read and the request stays open on the server.
+    // Mirrors the Rust client's `abandoning_a_body_cancels_the_stream`.
+    const { transport, clientReader, serverWriter } = mockTransport();
+    const conn = connect(transport);
+    const frames = new FrameReader(clientReader);
+    const reqP = conn.request({ path: "/stream", authority: "e" });
+    reqP.catch(() => {});
+    await frames.until((f) => f.type === FrameType.HEADERS && f.streamId === 1);
+    await sendResponseHead(serverWriter);
+    // An open-ended body: the server is still sending when the reader walks away.
+    await serverWriter.write(
+      serializeFrame({
+        type: FrameType.DATA,
+        streamId: 1,
+        data: encodeUtf8("partial"),
+        endStream: false,
+      }),
+    );
+
+    const res = await reqP;
+    await res.body.cancel();
+
+    const rst = await frames.until((f) => f.type === FrameType.RST_STREAM && f.streamId === 1);
+    // CANCEL, not an error code: nothing went wrong, the reader left.
+    if (rst.type !== FrameType.RST_STREAM) throw new Error("expected RST_STREAM");
+    expect(rst.errorCode).toBe(0x8);
+  }, 8000);
+
+  it("does not reset a body that was read to the end", async () => {
+    // The other half: a stream that finished normally is already closed, so there
+    // is nothing to cancel. Resetting here would be a spurious frame on a closed
+    // stream, and the rule is worthless if it cannot tell a completed download from
+    // an abandoned one.
+    const { transport, clientReader, serverWriter } = mockTransport();
+    const conn = connect(transport);
+    const frames = new FrameReader(clientReader);
+    const reqP = conn.request({ path: "/download", authority: "e" });
+    reqP.catch(() => {});
+    await frames.until((f) => f.type === FrameType.HEADERS && f.streamId === 1);
+    await sendResponseHead(serverWriter);
+    await serverWriter.write(
+      serializeFrame({
+        type: FrameType.DATA,
+        streamId: 1,
+        data: encodeUtf8("all of it"),
+        endStream: true,
+      }),
+    );
+
+    const res = await reqP;
+    const reader = res.body.getReader();
+    for (;;) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+    await reader.cancel();
+
+    // PING barrier: by the time its ack comes back, anything the client meant to
+    // send has been sent — so this fails fast instead of waiting on a frame that
+    // is never coming.
+    await serverWriter.write(
+      serializeFrame({
+        type: FrameType.PING,
+        streamId: 0,
+        ack: false,
+        opaqueData: new Uint8Array(8),
+      }),
+    );
+    const before: Frame[] = [];
+    for (;;) {
+      const f = await frames.next();
+      if (f.type === FrameType.PING && f.ack) break;
+      before.push(f);
+    }
+    expect(before.some((f) => f.type === FrameType.RST_STREAM)).toBe(false);
+  }, 8000);
+});

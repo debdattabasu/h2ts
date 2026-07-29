@@ -176,11 +176,25 @@ impl Stream for ResponseBody {
 
 impl Drop for ResponseBody {
     fn drop(&mut self) {
+        let (remaining, still_open) = {
+            let recv = self.recv.borrow();
+            (recv.buffered, !recv.ended)
+        };
         // Abandoned mid-stream: return the window for whatever is still buffered so
         // the connection window doesn't leak.
-        let remaining = self.recv.borrow().buffered;
         if remaining > 0 {
             self.replenish(remaining);
+        }
+        // ...and tell the peer to stop, because dropping the body is how a caller
+        // cancels. Without this the server keeps producing into a stream nobody will
+        // ever read: the request stays open, its handler keeps running, and a client
+        // that gave up — or whose deadline fired — silently leaks server work. RFC
+        // 7540 §8.1 calls for exactly this, and CANCEL is the code for "no longer
+        // interested" rather than an error.
+        if still_open {
+            if let Some(conn) = self.conn.upgrade() {
+                conn.borrow_mut().reset_stream(self.stream_id, ErrorCode::Cancel);
+            }
         }
     }
 }
@@ -398,6 +412,11 @@ impl StreamState {
         if recv.error.is_none() {
             recv.error = Some(err);
         }
+        // A failed stream is also a finished one. `poll_next` checks the queue, then
+        // the error, then this — so ordering is unchanged — but it means dropping the
+        // body afterwards does not mistake an already-dead stream for a live one and
+        // reset it a second time.
+        recv.ended = true;
         if let Some(w) = recv.waker.take() {
             w.wake();
         }
