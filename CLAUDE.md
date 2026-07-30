@@ -71,7 +71,8 @@ rust/  crates/
   wslay-sys/              FFI to vendored wslay C (sub-frame WS streaming)
   h2ts-conformance/ h2ts-wasm-conformance/   dev-only conformance drivers
 go/                       module github.com/debdattabasu/h2ts/go, package server (serve shape only)
-doc/                      status.md (client/server audit), StatusJul10.md (Go server + idle-TTL audit)
+doc/                      status.md (client/server audit), StatusJul10.md (Go server + idle-TTL audit),
+                          DocsRsJul30.md (vendored-C portability — the docs.rs build failure)
 Makefile                  fans out across stacks
 .github/workflows/ci.yml  the same targets on every push/PR (see CI below)
 ```

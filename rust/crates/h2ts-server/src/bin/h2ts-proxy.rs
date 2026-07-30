@@ -2,10 +2,12 @@
 //! server. A drop-in, in-Rust replacement for websockify (item 3), shipped as a
 //! binary of the `h2ts-server` crate.
 //!
-//!   browser (h2ts) --ws--> [h2ts-proxy] --tcp--> upstream h2c server
+//! ```text
+//! browser (h2ts) --ws--> [h2ts-proxy] --tcp--> upstream h2c server
 //!
 //! Usage: h2ts-proxy [listen_addr] [upstream_addr] [keepalive_secs] [--no-keepalive] [--allow-implicit-codec]
 //!        defaults:   127.0.0.1:8091   127.0.0.1:8000   30/15 (on)   (keepalive on) (off; require h2ts)
+//! ```
 //!
 //! Server-initiated keepalive is **on by default** (ping an idle client every 30s,
 //! close it with 1001 Going Away if no response in a further 15s) so a silently-
