@@ -86,6 +86,7 @@ make test-ts         # npm test + typecheck for @debdattabasu/h2ts
 make test-go         # cd go && go vet ./... && go test ./...
 make conformance     # client(s) -> Rust h2ts-proxy -> Node h2c origin
 make conformance-go  # same battery, but against the Go serve gateway (GATEWAY=go)
+make docs            # rustdoc for the published crates, warnings = errors (docs.rs parity)
 ```
 
 Per stack, directly:
@@ -102,7 +103,11 @@ Per stack, directly:
 to `main` and every PR: one job per stack (Rust `cargo test` + `clippy -D warnings`, TS
 vitest/typecheck/build, Go `vet` + `test -race` + `gofmt`), plus a **conformance matrix**
 over both gateways with `CLIENT=all` — so the wasm client's real browser WebSocket path
-is covered too. Two deliberate omissions: `cargo fmt --check` is not gated (the known
+is covered too. A separate **`docs`** job reproduces the *docs.rs* build (`make docs`,
+but with `CC=gcc-14`): the runner's default gcc is 13 and `wslay-sys` compiles its
+vendored C with warnings off, so a green `rust` job says nothing about docs.rs, which
+builds on a newer toolchain. That gap shipped a broken docs build twice — see
+[`doc/DocsRsJul30.md`](doc/DocsRsJul30.md). Two deliberate omissions: `cargo fmt --check` is not gated (the known
 rustfmt-version diff would just fail everywhere), and there is **no publishing from CI** —
 releases stay the manual flow under Conventions, so a crates.io push is never one merge
 away. The wasm-bindgen CLI version is read out of `rust/Cargo.lock` rather than pinned in

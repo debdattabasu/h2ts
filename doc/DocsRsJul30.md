@@ -87,6 +87,17 @@ reliable route.
 - [x] **Released** — `wslay-sys` 0.1.2 (own code changed) and `h2ts-server` 0.1.4
   (doc comment changed, and needs the new dependency floor). `h2ts-client` links no
   wslay and its 0.1.3 docs built fine, so it stays put.
-- [ ] **Open — CI cannot catch a recurrence.** `ubuntu-latest` is GCC 13, where this is
-  a `-w`-suppressed warning. A `cargo doc` job (or a newer-toolchain C build) would close
-  the gap; deliberately not added here to keep the release change focused.
+- [x] **CI gap closed** — _done 2026-07-30, after the release._ A `docs` job in
+  `.github/workflows/ci.yml` runs `cargo doc --no-deps` over the three published crates
+  with `CC=gcc-14` and `RUSTDOCFLAGS=-D warnings`; `make docs` is the local half (without
+  the toolchain pin). Verified by reverting each fix in isolation against the job's exact
+  command on GCC 14.2: reverting `build.rs` alone reproduces the `implicit declaration of
+  function 'htons'` error, reverting the `h2ts-proxy` doc comment alone fails on the three
+  `unresolved link` errors, and the current tree passes. Both regressions are therefore
+  gated, not merely fixed.
+
+  Note on why this needs a real toolchain bump rather than a flag: `-w` (from
+  `.warnings(false)`) beats `-Werror=implicit-function-declaration` on GCC ≤ 13 in
+  *either* order — measured on GCC 12.2 — so there is no CFLAGS-only assertion that would
+  work on the default runner. GCC 14+ makes it a default-on **error**, which `-w` cannot
+  downgrade, so the version bump is what does the work.

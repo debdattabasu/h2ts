@@ -6,6 +6,9 @@
 # sufficient — what proves *interop* is `conformance`, the executable form of
 # spec/protocol.md. Every gateway runs the same battery through every client, so
 # it is a matrix (`make conformance` / `make conformance-go`, with CLIENT=all).
+#
+# `docs` is the odd one out: it exists to reproduce the *docs.rs* build, which no
+# other job resembles, because a green CI here is not evidence that docs.rs is green.
 name: CI
 
 on:
@@ -54,6 +57,42 @@ jobs:
       # `cargo fmt --check` is deliberately NOT gated here: the tree carries a
       # known rustfmt-version diff (see CLAUDE.md), and pinning CI to one rustfmt
       # would only move that disagreement rather than settle it.
+
+  docs:
+    name: docs (docs.rs parity)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: docs
+      # gcc-14 is the whole point of this job, not incidental setup. The runner's
+      # default gcc is 13, and wslay-sys compiles the vendored wslay C with warnings
+      # off (`.warnings(false)` -> `-w`), so anything GCC 13 merely warns about is
+      # invisible to the `rust` job. docs.rs builds on a newer image where
+      # -Wimplicit-function-declaration is an *error* by default, and `-w` does not
+      # downgrade a default-on error — which is exactly how a missing
+      # HAVE_ARPA_INET_H shipped in two releases under a fully green CI. Note the
+      # ordering trick does not help: `-w` beats `-Werror=implicit-function-declaration`
+      # on GCC <= 13 whichever order they appear in, so this must be a real toolchain
+      # bump rather than an added flag. See doc/DocsRsJul30.md.
+      - name: Install libclang (bindgen) + GCC 14
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev gcc-14
+
+      # The three published crates, documented the way docs.rs documents them.
+      # RUSTDOCFLAGS gates rustdoc itself too, so a broken intra-doc link fails the
+      # build instead of quietly degrading the rendered page.
+      - name: cargo doc
+        env:
+          CC: gcc-14
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --locked -p h2ts-server -p wslay-sys -p h2ts-client
 
   typescript:
     name: typescript (vitest + typecheck + build)
