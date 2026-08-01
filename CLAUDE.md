@@ -148,12 +148,20 @@ gateway/client combination must pass it identically.
 
 - **Commits:** `type: summary — detail` (`feat`/`test`/`doc`/`release`/`chore`). Work
   lands on `main`.
-- **Releases** (Rust → crates.io, TS → npm; no git tags): bump the version, update the
+- **Releases** (Rust → crates.io, TS → npm): bump the version, update the
   crate/package README + `doc/`, `cargo publish --dry-run` (or `npm pack`), commit
   `release: <name> <version> — …`, then publish, then push. Only republish a crate whose
   own code changed (e.g. the idle-TTL change touched only `h2ts-server` → 0.1.2; the
   client crates and `wslay-sys` were untouched, so they stayed put). crates.io publishes
   are irreversible.
+- **Release tags**, one per published artifact, each on the commit that carried that
+  version — annotated, naming the registry and date. Naming follows each ecosystem's own
+  tooling default: crates get `<crate>-v<version>` (cargo-release), the npm package gets
+  `<pkg>@<version>` (`@debdattabasu/h2ts@0.1.2`). A version bump that ships in a
+  `feat`/`fix` commit rather than a `release:` one still gets a tag on *that* commit —
+  `h2ts-client-v0.1.3` sits on the fix, not on a release commit. Tag after publishing,
+  so a tag always means "this went to the registry"; pushed tags are effectively
+  permanent, so verify the manifest in the tagged tree first.
 - **Docs:** substantial audits/decisions go in `doc/` (e.g. the flow-control and
   test-coverage analysis in `StatusJul10.md`), with a work log kept current.
 - **Match the surrounding code** — comment density, naming, and idiom differ per stack;
